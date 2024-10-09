@@ -2,10 +2,10 @@
 
 import logging
 import pandas as pd
-from surprise import accuracy, Dataset
-from surprise.model_selection import cross_validate
+from surprise import Dataset
 from surprise import SVD, KNNBasic, KNNWithMeans, KNNBaseline, SVDpp, NMF
 from src import config
+from src.models.evaluation import precision_at_k, recall_at_k, f_score_at_k, ndcg_at_k, calculate_diversity, calculate_novelty, estimated_ctr, calculate_coverage
 
 class CollaborativeFilteringRecommender:
     def __init__(self, data, algorithm='SVD', algo_params=None):
@@ -27,7 +27,7 @@ class CollaborativeFilteringRecommender:
     @staticmethod
     def get_algorithm_static(algorithm_name, algo_params):
         """
-        Static method to get an algorithm instance for hyperparameter tuning.
+        Static method to get an algorithm instance.
         """
         algorithms = {
             'SVD': SVD,
@@ -47,36 +47,15 @@ class CollaborativeFilteringRecommender:
         """
         return self.get_algorithm_static(algorithm_name, self.algo_params)
 
-    def cross_validate(self, cv=5):
-        """
-        Performs cross-validation and returns the average RMSE and MAE.
-        """
-        logging.info(f"Performing cross-validation with {cv}-folds...")
-        results = cross_validate(self.algo, self.data, measures=['RMSE', 'MAE'], cv=cv, verbose=False)
-        avg_rmse = results['test_rmse'].mean()
-        avg_mae = results['test_mae'].mean()
-        logging.info(f"Cross-Validation Results - RMSE: {avg_rmse:.4f}, MAE: {avg_mae:.4f}")
-        return avg_rmse, avg_mae
-
     def train(self):
         """
         Trains the collaborative filtering model.
         """
+        logging.info(f"Training Collaborative Filtering model using {self.algorithm_name}...")
         self.trainset = self.data.build_full_trainset()
         self.algo.fit(self.trainset)
         self.trained = True
-
-    def evaluate(self, testset):
-        """
-        Evaluates the model on the test set and returns the RMSE and MAE.
-        """
-        if not self.trained:
-            self.train()
-
-        predictions = self.algo.test(testset)
-        rmse = accuracy.rmse(predictions, verbose=False)
-        mae = accuracy.mae(predictions, verbose=False)
-        return rmse, mae
+        logging.info("Collaborative Filtering model training complete.")
 
     def get_recommendations(self, user_id, top_k=config.TOP_K, exclude_items=None):
         """
@@ -86,6 +65,9 @@ class CollaborativeFilteringRecommender:
         - user_id: The user ID for whom to generate recommendations.
         - top_k: The number of recommendations to generate.
         - exclude_items: A list of item IDs to exclude from recommendations (e.g., items the user has already interacted with).
+
+        Returns:
+        - A list of recommended TITLE_IDs.
         """
         if not self.trained:
             self.train()
@@ -114,6 +96,36 @@ class CollaborativeFilteringRecommender:
         top_k_items = [pred.iid for pred in predictions[:top_k]]
 
         return top_k_items
+
+    def evaluate(self, user_ids, relevant_items_dict, top_k=config.TOP_K):
+        """
+        Evaluates the collaborative filtering recommender using precision, recall, and F-score.
+
+        Parameters:
+        - user_ids: List of user IDs to evaluate on.
+        - relevant_items_dict: Dictionary where keys are user_ids and values are lists of relevant items.
+        - top_k: Number of recommendations to evaluate.
+
+        Returns:
+        - Tuple of average precision, recall, and F-score.
+        """
+        precisions = []
+        recalls = []
+
+        for user_id in user_ids:
+            relevant_items = relevant_items_dict.get(user_id, [])
+            recommendations = self.get_recommendations(user_id, top_k=top_k, exclude_items=None)
+
+            precision = precision_at_k(recommendations, relevant_items, k=top_k)
+            recall = recall_at_k(recommendations, relevant_items, k=top_k)
+            precisions.append(precision)
+            recalls.append(recall)
+
+        avg_precision = sum(precisions) / len(precisions) if precisions else 0.0
+        avg_recall = sum(recalls) / len(recalls) if recalls else 0.0
+        avg_f_score = f_score_at_k(avg_precision, avg_recall)
+
+        return avg_precision, avg_recall, avg_f_score
 
     def get_predicted_ratings(self, user_id):
         """

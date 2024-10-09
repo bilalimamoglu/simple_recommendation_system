@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.logger import setup_logging
 from app.parser import parse_arguments
+from app.utils import set_seed
 from src import config
 from src.data_processing import (
     load_data, clean_titles_data, clean_interactions_data,
@@ -26,65 +27,18 @@ from src.models.evaluation import (
     calculate_coverage
 )
 from sklearn.decomposition import TruncatedSVD
-from hyperopt import fmin, tpe, hp, Trials, STATUS_OK, space_eval
 
 setup_logging()
-
-def tune_hyperparameters(algo_name, data, max_evals=20):
-    """
-    Tunes hyperparameters for the collaborative filtering algorithm using Hyperopt.
-    """
-    from surprise.model_selection import cross_validate
-
-    def objective(params):
-        if algo_name in ['SVD', 'KNNBasic', 'KNNWithMeans', 'KNNBaseline']:
-            algo = CollaborativeFilteringRecommender.get_algorithm_static(algo_name, params)
-        else:
-            return {'loss': float('inf'), 'status': STATUS_OK}
-
-        cv_results = cross_validate(algo, data, measures=['RMSE'], cv=3, verbose=False)
-        mean_rmse = cv_results['test_rmse'].mean()
-        return {'loss': mean_rmse, 'status': STATUS_OK}
-
-    if algo_name == 'SVD':
-        space = {
-            'n_factors': hp.choice('n_factors', [20, 50, 100, 150]),
-            'n_epochs': hp.choice('n_epochs', [10, 20, 30]),
-            'lr_all': hp.uniform('lr_all', 0.002, 0.01),
-            'reg_all': hp.uniform('reg_all', 0.02, 0.1),
-        }
-    elif algo_name in ['KNNBasic', 'KNNWithMeans', 'KNNBaseline']:
-        space = {
-            'k': hp.choice('k', [10, 20, 40, 60]),
-            'min_k': hp.choice('min_k', [1, 2, 3]),
-            'sim_options': {
-                'name': hp.choice('name', ['cosine', 'msd']),
-                'user_based': hp.choice('user_based', [True, False]),
-            }
-        }
-    else:
-        return {}
-
-    trials = Trials()
-    best = fmin(objective, space, algo=tpe.suggest, max_evals=max_evals, trials=trials)
-    best_params = space_eval(space, best)
-
-    logging.info(f"Best hyperparameters for {algo_name}: {best_params}")
-    return best_params
+set_seed()
 
 def main():
     # Parse arguments
     args = parse_arguments()
-    algorithms = args.algorithms.split(',')
+    algorithms = [alg.strip() for alg in args.algorithms.split(',')]
 
     # Update config with arguments
     config.TOP_K = args.top_k
-
-    # Determine sample_percentage for hyperparameter tuning
-    if args.fast_tuning:
-        tuning_sample_percentage = 5.0
-    else:
-        tuning_sample_percentage = 100.0  # Use full data for tuning if fast_tuning is not enabled
+    config.ALPHA = args.alpha  # Ensure ALPHA is set in config if used elsewhere
 
     # Load or preprocess data
     if os.path.exists(config.PROCESSED_TITLES_PATH) and os.path.exists(config.PROCESSED_INTERACTIONS_PATH):
@@ -132,13 +86,7 @@ def main():
     train_df_full = interactions_df.iloc[:split_index].reset_index(drop=True)
     test_df = interactions_df.iloc[split_index:].reset_index(drop=True)
 
-    # Apply sample percentage for training
-    if args.sample_percentage < 100.0:
-        logging.info(f"Sampling {args.sample_percentage}% of training data...")
-        train_df_full = train_df_full.sample(frac=args.sample_percentage / 100.0,
-                                             random_state=config.RANDOM_STATE).reset_index(drop=True)
-
-    logging.info(f"Number of training data points after sampling: {len(train_df_full)}")
+    logging.info(f"Number of training data points: {len(train_df_full)}")
     logging.info(f"Number of test data points: {len(test_df)}")
 
     # Use the Reader class to parse the DataFrame
@@ -146,24 +94,42 @@ def main():
     max_rating = interactions_df['rating'].max()
     reader = Reader(rating_scale=(min_rating, max_rating))
 
-    # Build full trainset for final model training
+    # Build full trainset for collaborative filtering
     full_train_data = Dataset.load_from_df(
         train_df_full[['BE_ID', 'TITLE_ID', 'rating']],
         reader
     )
 
-    # Build testset
-    testset = list(test_df[['BE_ID', 'TITLE_ID', 'rating']].itertuples(index=False, name=None))
-
     # Initialize and train content-based recommender
     logging.info('Initializing content-based recommender...')
-    content_recommender = ContentBasedRecommender(titles_df, count_matrix)
+    content_recommender = ContentBasedRecommender(titles_df, count_matrix, algorithm='cosine')
     content_recommender.train()
 
-    # Build user profiles using the training data
-    content_recommender.build_user_profiles(train_df_full)
+    # Initialize and train collaborative filtering recommenders
+    collaborative_recommenders = []
+    for algo in algorithms:
+        logging.info(f'Initializing collaborative filtering recommender with algorithm: {algo}')
+        collaborative_recommender = CollaborativeFilteringRecommender(
+            data=full_train_data,
+            algorithm=algo,
+            algo_params={}  # Empty as hyperparameter tuning is removed
+        )
+        collaborative_recommender.train()
+        collaborative_recommenders.append(collaborative_recommender)
 
-    # Prepare item features for diversity calculation using TruncatedSVD
+    # Initialize and train hybrid recommenders
+    hybrid_recommenders = []
+    for collaborative_recommender in collaborative_recommenders:
+        logging.info('Initializing hybrid recommender...')
+        hybrid_recommender = HybridRecommender(
+            content_recommender=content_recommender,
+            collaborative_recommender=collaborative_recommender,
+            alpha=args.alpha
+        )
+        hybrid_recommender.train()
+        hybrid_recommenders.append(hybrid_recommender)
+
+    # Prepare item features for diversity and novelty calculations
     svd = TruncatedSVD(n_components=100, random_state=config.RANDOM_STATE)
     reduced_item_features = svd.fit_transform(count_matrix)
     item_indices = titles_df['TITLE_ID'].tolist()
@@ -178,171 +144,116 @@ def main():
     # Initialize results list
     results = []
 
-    # Evaluate content-based recommender
+    # Evaluate Content-Based Recommender
     if 'content' in model_types:
         logging.info("Evaluating Content-Based Model...")
 
-        # Get list of users in test set
-        test_users = test_df['BE_ID'].unique()
+        # Define test titles for evaluation
+        test_titles = ['tm107473', 'tm50355', 'ts89259']
 
-        # Create relevant items dictionary
-        relevant_items_dict = test_df.groupby('BE_ID')['TITLE_ID'].apply(list).to_dict()
+        # Create relevant items dictionary (replace with actual relevant TITLE_IDs)
+        relevant_titles_dict = {
+            'tm107473': ['tm1074731', 'tm1074732', 'tm1074733'],  # Replace with actual relevant TITLE_IDs
+            'tm50355': ['tm503551', 'tm503552', 'tm503553'],
+            'ts89259': ['ts892591', 'ts892592', 'ts892593']
+        }
 
         avg_precision, avg_recall, avg_f_score = content_recommender.evaluate(
-            user_ids=test_users,
-            relevant_items_dict=relevant_items_dict
+            test_titles=test_titles,
+            relevant_titles_dict=relevant_titles_dict,
+            top_k=config.TOP_K
         )
         logging.info(f"Content-Based Model Evaluation - Precision@K: {avg_precision:.4f}, Recall@K: {avg_recall:.4f}, F-Score@K: {avg_f_score:.4f}")
 
-        # Choose a user with most interactions in test set
-        user_id = test_df['BE_ID'].value_counts().idxmax()
+        for title_id in test_titles:
+            recommendations = content_recommender.get_recommendations(title_id, top_k=config.TOP_K, exclude_items=None)
+            recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
+            logging.info(f"\nContent-Based Recommendations for Title ID '{title_id}':")
+            for title in recommended_titles:
+                logging.info(title)
 
-        # Get relevant items from test set
-        relevant_items = test_df[test_df['BE_ID'] == user_id]['TITLE_ID'].unique()
+            # Evaluate individual recommendations if relevant items are provided
+            relevant_items = relevant_titles_dict.get(title_id, [])
+            if relevant_items:
+                precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
+                recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
+                f_score = f_score_at_k(precision, recall)
+                ndcg = ndcg_at_k(recommendations, relevant_items, k=config.TOP_K)
+                diversity = calculate_diversity(recommendations, item_features_dict)
+                novelty = calculate_novelty(recommendations, item_popularity)
+                coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
+                ctr = estimated_ctr(recommendations, relevant_items)
 
-        # Get user's training interactions to exclude from recommendations
-        user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].unique()
+                logging.info(f"\nContent-Based Recommendations Evaluation for Title ID '{title_id}':")
+                logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
+                logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
+                logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
+                logging.info(f"NDCG@{config.TOP_K}: {ndcg:.4f}")
+                logging.info(f"Diversity: {diversity:.4f}")
+                logging.info(f"Novelty: {novelty:.4f}")
+                logging.info(f"Coverage: {coverage:.4f}")
+                logging.info(f"Estimated CTR: {ctr:.4f}")
 
-        recommendations = content_recommender.get_recommendations(user_id, exclude_items=user_train_items)
+                # Store results
+                result_entry = {
+                    'Model Type': 'Content-Based',
+                    'Algorithm': 'Cosine Similarity',
+                    'Title ID': title_id,
+                    'Precision@K': precision,
+                    'Recall@K': recall,
+                    'F-Score@K': f_score,
+                    'NDCG@K': ndcg,
+                    'Diversity': diversity,
+                    'Novelty': novelty,
+                    'Coverage': coverage,
+                    'Estimated CTR': ctr
+                }
 
-        # Map recommended item IDs to titles
-        recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
-        logging.info(f"\nContent-Based Recommendations for User ID '{user_id}':")
-        for title in recommended_titles:
-            logging.info(title)
+                results.append(result_entry)
 
-        # Evaluate recommendations
-        precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
-        recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
-        f_score = f_score_at_k(precision, recall)
-        ndcg = ndcg_at_k(recommendations, relevant_items, k=config.TOP_K)
-        diversity = calculate_diversity(recommendations, item_features_dict)
-        novelty = calculate_novelty(recommendations, item_popularity)
-        coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
-        ctr = estimated_ctr(recommendations, relevant_items)
+    # Evaluate Collaborative Filtering Recommender
+    if 'collaborative' in model_types:
+        logging.info("Evaluating Collaborative Filtering Model...")
+        # Removed user-based evaluations as per your request
 
-        logging.info(f"\nContent-Based Recommendations Evaluation:")
-        logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
-        logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
-        logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
-        logging.info(f"NDCG@{config.TOP_K}: {ndcg:.4f}")
-        logging.info(f"Diversity: {diversity:.4f}")
-        logging.info(f"Novelty: {novelty:.4f}")
-        logging.info(f"Coverage: {coverage:.4f}")
-        logging.info(f"Estimated CTR: {ctr:.4f}")
+    # Evaluate Hybrid Recommender
+    if 'hybrid' in model_types:
+        logging.info("Evaluating Hybrid Recommender Model...")
 
-        # Store results
-        result_entry = {
-            'Model Type': 'Content-Based',
-            'Algorithm': 'Content-Based',
-            'Precision@K': precision,
-            'Recall@K': recall,
-            'F-Score@K': f_score,
-            'NDCG@K': ndcg,
-            'Diversity': diversity,
-            'Novelty': novelty,
-            'Coverage': coverage,
-            'Estimated CTR': ctr
+        # Define test titles for evaluation
+        test_titles = ['tm107473', 'tm50355', 'ts89259']
+
+        # Create relevant items dictionary for test titles (replace with actual relevant TITLE_IDs)
+        relevant_titles_dict = {
+            'tm107473': ['tm1074731', 'tm1074732', 'tm1074733'],  # Replace with actual relevant TITLE_IDs
+            'tm50355': ['tm503551', 'tm503552', 'tm503553'],
+            'ts89259': ['ts892591', 'ts892592', 'ts892593']
         }
 
-        results.append(result_entry)
-
-    # Collaborative and Hybrid Model Evaluations
-    if any(mt in ['collaborative', 'hybrid'] for mt in model_types):
-        for algorithm in algorithms:
-            algorithm = algorithm.strip()
-            logging.info(f"Using algorithm: {algorithm}")
-
-            # Hyperparameter tuning
-            if args.fast_tuning:
-                logging.info("Hyperparameter tuning enabled with fast_tuning.")
-                # Sample a small percentage of data for tuning
-                tuning_sample_size = int(len(train_df_full) * (tuning_sample_percentage / 100.0))
-                tuning_df = train_df_full.sample(n=tuning_sample_size, random_state=config.RANDOM_STATE).reset_index(drop=True)
-                tuning_data = Dataset.load_from_df(
-                    tuning_df[['BE_ID', 'TITLE_ID', 'rating']],
-                    reader
-                )
-                # Tune hyperparameters
-                best_params = tune_hyperparameters(algorithm, tuning_data, max_evals=20)
-            else:
-                best_params = {}
-
-            # Set algorithm hyperparameters
-            if algorithm in ['KNNBasic', 'KNNWithMeans', 'KNNBaseline']:
-                default_params = {
-                    'k': 20,
-                    'min_k': 1,
-                    'sim_options': {
-                        'name': 'cosine',  # Use cosine similarity
-                        'user_based': False,  # Use item-item similarity
-                    }
-                }
-                algo_params = {**default_params, **best_params}
-            else:
-                default_params = {
-                    'n_factors': args.n_factors,
-                    'n_epochs': args.n_epochs,
-                    'random_state': config.RANDOM_STATE
-                }
-                algo_params = {**default_params, **best_params}
-
-            # Initialize collaborative filtering recommender
-            collaborative_recommender = CollaborativeFilteringRecommender(
-                data=full_train_data,
-                algorithm=algorithm,
-                algo_params=algo_params
+        for hybrid_recommender in hybrid_recommenders:
+            avg_precision, avg_recall, avg_f_score = hybrid_recommender.evaluate(
+                identifiers=test_titles,
+                relevant_items_dict=relevant_titles_dict,
+                top_k=config.TOP_K,
+                identifier_type='title'
             )
+            logging.info(f"Hybrid Recommender Model Evaluation - Precision@K: {avg_precision:.4f}, Recall@K: {avg_recall:.4f}, F-Score@K: {avg_f_score:.4f}")
 
-            # Cross-validation (optional)
-            if args.cross_validate:
-                cv_precision, cv_recall = collaborative_recommender.cross_validate(cv=5)
-                cv_f_score = f_score_at_k(cv_precision, cv_recall)
-                logging.info(f"Cross-Validation Results - Precision@K: {cv_precision:.4f}, Recall@K: {cv_recall:.4f}, F-Score@K: {cv_f_score:.4f}")
-
-            # Train on full training set
-            collaborative_recommender.train()
-
-            # Get list of users in both train and test sets
-            test_users = set(test_df['BE_ID'].unique())
-            train_users = set(train_df_full['BE_ID'].unique())
-            common_users = test_users & train_users
-
-            if not common_users:
-                logging.warning("No common users between train and test set.")
-                continue
-
-            # Choose a user with most interactions in test set among common users
-            user_interaction_counts = test_df[test_df['BE_ID'].isin(common_users)]['BE_ID'].value_counts()
-            user_id = user_interaction_counts.idxmax()
-
-            # Get relevant items from test set
-            relevant_items = test_df[test_df['BE_ID'] == user_id]['TITLE_ID'].unique()
-
-            # Get user's training interactions to exclude from recommendations
-            user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].unique()
-
-            if 'collaborative' in model_types:
-                # Collaborative filtering recommendations
-                recommendations = collaborative_recommender.get_recommendations(user_id, exclude_items=user_train_items)
-
-                # Map recommended item IDs to titles
+            for title_id in test_titles:
+                recommendations = hybrid_recommender.get_recommendations(
+                    identifier=title_id,
+                    top_k=config.TOP_K,
+                    exclude_items=None,
+                    identifier_type='title'
+                )
                 recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
-                logging.info(f"\nCollaborative Recommendations for User ID '{user_id}':")
+                logging.info(f"\nHybrid Recommendations for Title ID '{title_id}':")
                 for title in recommended_titles:
                     logging.info(title)
 
-                # Log the number of recommendations and relevant items
-                logging.info(f"Number of recommended items for collaborative: {len(recommendations)}")
-                logging.info(f"Number of relevant items for user {user_id}: {len(relevant_items)}")
-
-                # Handle empty recommendations or relevant items
-                if not recommendations:
-                    logging.warning(f"No recommendations generated for collaborative.")
-                elif len(relevant_items) == 0:
-                    logging.warning(f"No relevant items found for user {user_id}.")
-                else:
-                    # Evaluate recommendations
+                # Evaluate individual recommendations if relevant items are provided
+                relevant_items = relevant_titles_dict.get(title_id, [])
+                if relevant_items:
                     precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
                     recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
                     f_score = f_score_at_k(precision, recall)
@@ -352,74 +263,7 @@ def main():
                     coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
                     ctr = estimated_ctr(recommendations, relevant_items)
 
-                    logging.info(f"\nCollaborative Recommendations Evaluation:")
-                    logging.info(f"Algorithm: {algorithm}")
-                    logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
-                    logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
-                    logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
-                    logging.info(f"NDCG@{config.TOP_K}: {ndcg:.4f}")
-                    logging.info(f"Diversity: {diversity:.4f}")
-                    logging.info(f"Novelty: {novelty:.4f}")
-                    logging.info(f"Coverage: {coverage:.4f}")
-                    logging.info(f"Estimated CTR: {ctr:.4f}")
-
-                    # Store results
-                    result_entry = {
-                        'Model Type': 'Collaborative',
-                        'Algorithm': algorithm,
-                        'Precision@K': precision,
-                        'Recall@K': recall,
-                        'F-Score@K': f_score,
-                        'NDCG@K': ndcg,
-                        'Diversity': diversity,
-                        'Novelty': novelty,
-                        'Coverage': coverage,
-                        'Estimated CTR': ctr
-                    }
-
-                    if args.cross_validate:
-                        result_entry['Cross-Validation Precision@K'] = cv_precision
-                        result_entry['Cross-Validation Recall@K'] = cv_recall
-                        result_entry['Cross-Validation F-Score@K'] = cv_f_score
-
-                    results.append(result_entry)
-
-            if 'hybrid' in model_types:
-                # Hybrid recommendations
-                hybrid_recommender = HybridRecommender(content_recommender, collaborative_recommender, alpha=args.alpha)
-                hybrid_recommender.train()
-
-                recommendations = hybrid_recommender.get_recommendations(user_id, top_k=config.TOP_K, exclude_items=user_train_items)
-
-                # Map recommended item IDs to titles
-                recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
-                logging.info(f"\nHybrid Recommendations for User ID '{user_id}':")
-                for title in recommended_titles:
-                    logging.info(title)
-
-                # Log the number of recommendations and relevant items
-                logging.info(f"Number of recommended items for hybrid: {len(recommendations)}")
-                logging.info(f"Number of relevant items for user {user_id}: {len(relevant_items)}")
-
-                # Handle empty recommendations or relevant items
-                if not recommendations:
-                    logging.warning(f"No recommendations generated for hybrid.")
-                elif len(relevant_items) == 0:
-                    logging.warning(f"No relevant items found for user {user_id}.")
-                else:
-                    # Evaluate recommendations
-                    precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
-                    recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
-                    f_score = f_score_at_k(precision, recall)
-                    ndcg = ndcg_at_k(recommendations, relevant_items, k=config.TOP_K)
-                    diversity = calculate_diversity(recommendations, item_features_dict)
-                    novelty = calculate_novelty(recommendations, item_popularity)
-                    coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
-                    ctr = estimated_ctr(recommendations, relevant_items)
-
-                    logging.info(f"\nHybrid Recommendations Evaluation:")
-                    logging.info(f"Algorithm: {algorithm}")
-                    logging.info(f"Alpha: {args.alpha}")
+                    logging.info(f"\nHybrid Recommendations Evaluation for Title ID '{title_id}':")
                     logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
                     logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
                     logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
@@ -432,8 +276,8 @@ def main():
                     # Store results
                     result_entry = {
                         'Model Type': 'Hybrid',
-                        'Algorithm': algorithm,
-                        'Alpha': args.alpha,
+                        'Algorithm': 'Content + Collaborative',
+                        'Title ID': title_id,
                         'Precision@K': precision,
                         'Recall@K': recall,
                         'F-Score@K': f_score,
@@ -444,19 +288,17 @@ def main():
                         'Estimated CTR': ctr
                     }
 
-                    if args.cross_validate:
-                        result_entry['Cross-Validation Precision@K'] = cv_precision
-                        result_entry['Cross-Validation Recall@K'] = cv_recall
-                        result_entry['Cross-Validation F-Score@K'] = cv_f_score
-
                     results.append(result_entry)
 
     # Create a DataFrame to display results
-    results_df = pd.DataFrame(results)
-    results_df = results_df.sort_values('NDCG@K', ascending=False)
+    if results:
+        results_df = pd.DataFrame(results)
+        results_df = results_df.sort_values('NDCG@K', ascending=False)
 
-    logging.info('\nModel Ranking Based on NDCG@K:')
-    logging.info('\n' + results_df.to_string(index=False))
+        logging.info('\nModel Ranking Based on NDCG@K:')
+        logging.info('\n' + results_df.to_string(index=False))
+    else:
+        logging.info("No evaluation results to display.")
 
 if __name__ == '__main__':
     main()
