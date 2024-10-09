@@ -50,28 +50,3 @@ class ContentBasedRecommender:
         sim_scores_series = pd.Series({self.titles_df['TITLE_ID'].iloc[i]: score for i, score in sim_scores})
 
         return sim_scores_series
-
-    def predict_ratings(self, testset):
-        """
-        Predicts ratings for user-item pairs in the testset.
-
-        Parameters:
-        - testset: A list of (user_id, item_id, actual_rating) tuples.
-
-        Returns:
-        - A list of surprise.Prediction objects.
-        """
-        predictions = []
-        for user_id, item_id, actual_rating in testset:
-            # For content-based, we can use average similarity scores as predicted ratings
-            sim_scores = self.get_similarity_scores(item_id)
-            if sim_scores.empty:
-                est_rating = 0  # or some default value
-            else:
-                est_rating = sim_scores.mean()
-
-            # Create a Prediction object
-            pred = Prediction(uid=user_id, iid=item_id, r_ui=actual_rating, est=est_rating, details=None)
-            predictions.append(pred)
-
-        return predictions

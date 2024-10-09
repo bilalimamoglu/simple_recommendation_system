@@ -6,6 +6,9 @@ import os
 import time
 import pandas as pd
 from surprise import Dataset, Reader
+
+from app.logger import setup_logging
+from app.parser import parse_arguments
 from src import config
 from src.data_processing import load_data, clean_titles_data, clean_interactions_data, save_processed_data, load_processed_data
 from src.feature_engineering import process_text_features, create_count_matrix
@@ -20,45 +23,8 @@ from src.models.evaluation import (
 from sklearn.decomposition import TruncatedSVD
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK, space_eval
 
-def setup_logging(log_file='recommender.log'):
-    """
-    Sets up logging to output to console and file.
-    """
-    log_dir = os.path.join(config.BASE_DIR, 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, log_file)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(message)s',
-        handlers=[
-            logging.FileHandler(log_file_path, mode='w'),
-            logging.StreamHandler()
-        ]
-    )
+setup_logging()
 
-def parse_arguments():
-    """
-    Parses command-line arguments for hyperparameters and model options.
-    """
-
-    parser = argparse.ArgumentParser(description='Recommendation System')
-
-    parser.add_argument('--algorithms', type=str, default='SVD', help='Collaborative filtering algorithms to use, separated by commas (e.g., SVD,KNNBasic)')
-    parser.add_argument('--model_type', type=str, default='all', help='Type of recommender: content, collaborative, hybrid, all')
-    parser.add_argument('--top_k', type=int, default=10, help='Number of recommendations to generate')
-    parser.add_argument('--max_features', type=int, default=None, help='Max features for count vectorizer (default: use all features)')
-    parser.add_argument('--alpha', type=float, default=0.5, help='Weighting factor for hybrid recommender')
-    parser.add_argument('--n_factors', type=int, default=50, help='Number of factors for SVD')
-    parser.add_argument('--n_epochs', type=int, default=20, help='Number of epochs for SVD')
-    parser.add_argument('--sample_percentage', type=float, default=20.0, help='Percentage of data to use for training')
-    parser.add_argument('--fast_tuning', action='store_true', help='Enable fast hyperparameter tuning with less data (5%)')
-    parser.add_argument('--cross_validate', action='store_true', help='Enable cross-validation for collaborative filtering')
-    parser.add_argument('--test_train', type=bool, help='check test or train',default=True)
-    parser.add_argument('--', action='store_true', help='Enable cross-validation for collaborative filtering')
-
-
-    args = parser.parse_args()
-    return args
 
 def tune_hyperparameters(algo_name, data, max_evals=20):
     """
@@ -113,8 +79,6 @@ def tune_hyperparameters(algo_name, data, max_evals=20):
     return best_params
 
 def main():
-    # Setup logging
-    setup_logging()
 
     # Parse arguments
     args = parse_arguments()
