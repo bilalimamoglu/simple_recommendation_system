@@ -19,8 +19,6 @@ def parse_arguments():
     parser.add_argument('--fast_tuning', action='store_true', help='Enable fast hyperparameter tuning with less data (5%)')
     parser.add_argument('--cross_validate', action='store_true', help='Enable cross-validation for collaborative filtering')
     parser.add_argument('--test_train', type=bool, help='check test or train',default=True)
-    parser.add_argument('--', action='store_true', help='Enable cross-validation for collaborative filtering')
-
 
     args = parser.parse_args()
     return args
