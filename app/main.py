@@ -5,8 +5,9 @@ import logging
 import os
 import pandas as pd
 from surprise import Dataset, Reader
-from tqdm import tqdm  # Added tqdm for progress bars
-import random  # Added random for sampling
+from tqdm import tqdm  # For progress bars
+import random
+from sklearn.model_selection import StratifiedShuffleSplit  # For stratified sampling
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -90,33 +91,23 @@ def main():
     logging.info(f"Number of training data points: {len(train_df_full)}")
     logging.info(f"Number of test data points: {len(test_df)}")
 
-    # Implement Sampling Strategy using sample_percentage from arguments
-    logging.info('Applying sampling strategy to training data...')
-    sample_frac = args.sample_percentage / 100.0
-    train_df_sampled = train_df_full.sample(frac=sample_frac, random_state=config.RANDOM_STATE).reset_index(drop=True)
-    logging.info(f"Number of training data points after sampling ({args.sample_percentage}%): {len(train_df_sampled)}")
+    # Apply stratified sampling for evaluation
+    logging.info('Applying stratified sampling to select 1000 users for evaluation...')
+    user_interaction_counts = train_df_full.groupby('BE_ID').size().reset_index(name='interaction_count')
 
-    # Identify common users present in both training and test sets
-    logging.info('Identifying common users present in both training and test sets...')
-    common_users = set(train_df_sampled['BE_ID']).intersection(set(test_df['BE_ID']))
-    logging.info(f"Number of common users for evaluation: {len(common_users)}")
+    # Define number of strata (e.g., 5 bins)
+    n_strata = 5
+    user_interaction_counts['interaction_bin'] = pd.qcut(user_interaction_counts['interaction_count'], q=n_strata, labels=False, duplicates='drop')
 
-    if not common_users:
-        logging.error("No common users found between training and test sets. Adjust the sampling percentage or check your data.")
-        return
+    # Initialize StratifiedShuffleSplit
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=1000, random_state=config.RANDOM_STATE)
+    for train_idx, test_idx in splitter.split(user_interaction_counts, user_interaction_counts['interaction_bin']):
+        sampled_users = user_interaction_counts.iloc[test_idx]['BE_ID'].tolist()
 
-    # Sample 1000 users from common_users for evaluation
-    sample_size = 1000
-    if len(common_users) >= sample_size:
-        sample_users = random.sample(list(common_users), sample_size)
-    else:
-        sample_users = list(common_users)
-        logging.warning(f"Requested sample size {sample_size} exceeds the number of common users. Evaluating on {len(sample_users)} users.")
-
-    logging.info(f"Number of users selected for evaluation: {len(sample_users)}")
+    logging.info(f"Number of users selected for evaluation: {len(sampled_users)}")
 
     # Filter test set to include only interactions from sampled users
-    test_df_filtered = test_df[test_df['BE_ID'].isin(sample_users)].reset_index(drop=True)
+    test_df_filtered = test_df[test_df['BE_ID'].isin(sampled_users)].reset_index(drop=True)
     logging.info(f"Number of test data points after filtering sampled users: {len(test_df_filtered)}")
 
     # Use the Reader class to parse the DataFrame
@@ -126,7 +117,7 @@ def main():
 
     # Build trainset for collaborative filtering
     train_data = Dataset.load_from_df(
-        train_df_sampled[['BE_ID', 'TITLE_ID', 'rating']],
+        train_df_full[['BE_ID', 'TITLE_ID', 'rating']],
         reader
     )
 
@@ -191,7 +182,7 @@ def main():
     if 'content' in model_types:
         logging.info("Evaluating Content-Based Model on the test set...")
 
-        for user_id in tqdm(sample_users, desc="Evaluating Content-Based Model"):
+        for user_id in tqdm(sampled_users, desc="Evaluating Content-Based Model"):
             # Get the items the user interacted with in the test set
             user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
@@ -199,7 +190,7 @@ def main():
                 continue  # Skip users with no test interactions
 
             # Get the user's training items
-            user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
             if not user_train_items:
                 continue  # Skip users with no training interactions
 
@@ -248,7 +239,7 @@ def main():
                 # User-Based Collaborative Filtering Evaluation
                 logging.info(f"Evaluating User-Based Collaborative Filtering Model: {collaborative_recommender.algorithm_name}")
 
-                for user_id in tqdm(sample_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
+                for user_id in tqdm(sampled_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
                     # Get the items the user interacted with in the test set
                     user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
@@ -291,7 +282,7 @@ def main():
                 # Item-Based Collaborative Filtering Evaluation
                 logging.info(f"Evaluating Item-Based Collaborative Filtering Model: {collaborative_recommender.algorithm_name}")
 
-                for user_id in tqdm(sample_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
+                for user_id in tqdm(sampled_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
                     # Get the items the user interacted with in the test set
                     user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
@@ -299,7 +290,7 @@ def main():
                         continue  # Skip users with no test interactions
 
                     # Get the user's training items
-                    user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                    user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
                     if not user_train_items:
                         continue  # Skip users with no training interactions
 
@@ -344,7 +335,7 @@ def main():
         logging.info("Evaluating Hybrid Recommender Models on the test set...")
 
         for hybrid_recommender in hybrid_recommenders:
-            for user_id in tqdm(sample_users, desc="Evaluating Hybrid Recommender"):
+            for user_id in tqdm(sampled_users, desc="Evaluating Hybrid Recommender"):
                 # Get the items the user interacted with in the test set
                 user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
@@ -352,7 +343,7 @@ def main():
                     continue  # Skip users with no test interactions
 
                 # Get the user's training items
-                user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
                 if not user_train_items:
                     continue  # Skip users with no training interactions
 
@@ -400,7 +391,6 @@ def main():
         average_metrics = results_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
         logging.info('\nAverage Recommendations Evaluation Results:')
         logging.info('\n' + average_metrics.to_string(index=False))
-
     else:
         logging.info("No evaluation results to display.")
 

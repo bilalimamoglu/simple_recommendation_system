@@ -53,6 +53,7 @@ def calculate_diversity(recommendations, item_features_dict):
     diversity = (2 * diversity) / (n * (n - 1)) if n > 1 else 0.0
     return diversity
 
+
 def calculate_novelty(recommendations, popularity_dict):
     """
     Calculates the novelty of the recommended items based on their popularity.
@@ -86,6 +87,7 @@ def estimated_ctr(recommended_items, user_interactions):
     clicked_items = recommended_set & interactions_set
     ctr = len(clicked_items) / len(recommended_items) if recommended_items else 0.0
     return ctr
+
 
 def calculate_coverage(recommendations, all_items):
     """
