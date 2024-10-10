@@ -91,18 +91,46 @@ def main():
     logging.info(f"Number of training data points: {len(train_df_full)}")
     logging.info(f"Number of test data points: {len(test_df)}")
 
-    # Apply stratified sampling for evaluation
+    # Apply sample percentage for training data
+    if args.sample_percentage < 100.0:
+        logging.info(f"Sampling {args.sample_percentage}% of training data...")
+        train_df_sampled = train_df_full.sample(frac=args.sample_percentage / 100.0,
+                                               random_state=config.RANDOM_STATE).reset_index(drop=True)
+    else:
+        train_df_sampled = train_df_full.copy()
+
+    # Log number of data points after sampling
+    logging.info(f"Number of training data points after sampling: {len(train_df_sampled)}")
+
+    # Identify common users present in both training and test sets
+    logging.info('Identifying common users present in both training and test sets...')
+    common_users = set(train_df_sampled['BE_ID']).intersection(set(test_df['BE_ID']))
+    logging.info(f"Number of common users for evaluation: {len(common_users)}")
+
+    if not common_users:
+        logging.error("No common users found between training and test sets. Adjust the sample percentage or check your data.")
+        return
+
+    # Perform stratified sampling among common users
     logging.info('Applying stratified sampling to select 1000 users for evaluation...')
-    user_interaction_counts = train_df_full.groupby('BE_ID').size().reset_index(name='interaction_count')
+    # Filter training data to include only common users
+    train_common = train_df_sampled[train_df_sampled['BE_ID'].isin(common_users)].reset_index(drop=True)
+
+    # Calculate interaction counts per user
+    user_interaction_counts = train_common.groupby('BE_ID').size().reset_index(name='interaction_count')
 
     # Define number of strata (e.g., 5 bins)
     n_strata = 5
-    user_interaction_counts['interaction_bin'] = pd.qcut(user_interaction_counts['interaction_count'], q=n_strata, labels=False, duplicates='drop')
-
-    # Initialize StratifiedShuffleSplit
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=1000, random_state=config.RANDOM_STATE)
-    for train_idx, test_idx in splitter.split(user_interaction_counts, user_interaction_counts['interaction_bin']):
-        sampled_users = user_interaction_counts.iloc[test_idx]['BE_ID'].tolist()
+    try:
+        user_interaction_counts['interaction_bin'] = pd.qcut(user_interaction_counts['interaction_count'], q=n_strata, labels=False, duplicates='drop')
+    except ValueError as e:
+        logging.warning(f"Stratified sampling encountered an issue: {e}. Falling back to uniform sampling.")
+        sampled_users = random.sample(list(common_users), min(1000, len(common_users)))
+    else:
+        # Initialize StratifiedShuffleSplit
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=1000, random_state=config.RANDOM_STATE)
+        for train_idx, test_idx in splitter.split(user_interaction_counts, user_interaction_counts['interaction_bin']):
+            sampled_users = user_interaction_counts.iloc[test_idx]['BE_ID'].tolist()
 
     logging.info(f"Number of users selected for evaluation: {len(sampled_users)}")
 
@@ -117,7 +145,7 @@ def main():
 
     # Build trainset for collaborative filtering
     train_data = Dataset.load_from_df(
-        train_df_full[['BE_ID', 'TITLE_ID', 'rating']],
+        train_df_sampled[['BE_ID', 'TITLE_ID', 'rating']],
         reader
     )
 
@@ -190,7 +218,7 @@ def main():
                 continue  # Skip users with no test interactions
 
             # Get the user's training items
-            user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
             if not user_train_items:
                 continue  # Skip users with no training interactions
 
@@ -250,7 +278,7 @@ def main():
                     recommendations = collaborative_recommender.get_recommendations(
                         identifier=user_id,
                         top_k=config.TOP_K,
-                        exclude_items=None,
+                        exclude_items=None,  # For user-based CF, exclude is handled within the recommender
                         identifier_type='user'
                     )
 
@@ -290,7 +318,7 @@ def main():
                         continue  # Skip users with no test interactions
 
                     # Get the user's training items
-                    user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                    user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
                     if not user_train_items:
                         continue  # Skip users with no training interactions
 
@@ -343,7 +371,7 @@ def main():
                     continue  # Skip users with no test interactions
 
                 # Get the user's training items
-                user_train_items = train_df_full[train_df_full['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
                 if not user_train_items:
                     continue  # Skip users with no training interactions
 
@@ -391,6 +419,12 @@ def main():
         average_metrics = results_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
         logging.info('\nAverage Recommendations Evaluation Results:')
         logging.info('\n' + average_metrics.to_string(index=False))
+
+        # Save results to a CSV file for further analysis
+        results_output_path = os.path.join(config.OUTPUT_DIR, 'recommendation_evaluation_results.csv')
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+        results_df.to_csv(results_output_path, index=False)
+        logging.info(f"Detailed evaluation results saved to {results_output_path}")
     else:
         logging.info("No evaluation results to display.")
 
