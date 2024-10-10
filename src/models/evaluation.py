@@ -77,8 +77,6 @@ def cosine_similarity(vec1, vec2):
         return 0.0  # Return zero similarity if either vector is zero
     return np.dot(vec1, vec2) / (norm1 * norm2)
 
-
-
 def estimated_ctr(recommended_items, user_interactions):
     """
     Estimates the CTR as the proportion of recommended items the user has interacted with.
@@ -88,7 +86,6 @@ def estimated_ctr(recommended_items, user_interactions):
     clicked_items = recommended_set & interactions_set
     ctr = len(clicked_items) / len(recommended_items) if recommended_items else 0.0
     return ctr
-
 
 def calculate_coverage(recommendations, all_items):
     """

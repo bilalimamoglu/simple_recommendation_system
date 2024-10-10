@@ -5,6 +5,8 @@ import logging
 import os
 import pandas as pd
 from surprise import Dataset, Reader
+from tqdm import tqdm  # Added tqdm for progress bars
+import random  # Added random for sampling
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,7 +70,6 @@ def main():
     # Ensure COLLECTOR_TSTAMP is datetime
     interactions_df['COLLECTOR_TSTAMP'] = pd.to_datetime(
         interactions_df['COLLECTOR_TSTAMP'],
-        infer_datetime_format=True,
         utc=True,
         errors='coerce'
     )
@@ -89,14 +90,43 @@ def main():
     logging.info(f"Number of training data points: {len(train_df_full)}")
     logging.info(f"Number of test data points: {len(test_df)}")
 
+    # Implement Sampling Strategy using sample_percentage from arguments
+    logging.info('Applying sampling strategy to training data...')
+    sample_frac = args.sample_percentage / 100.0
+    train_df_sampled = train_df_full.sample(frac=sample_frac, random_state=config.RANDOM_STATE).reset_index(drop=True)
+    logging.info(f"Number of training data points after sampling ({args.sample_percentage}%): {len(train_df_sampled)}")
+
+    # Identify common users present in both training and test sets
+    logging.info('Identifying common users present in both training and test sets...')
+    common_users = set(train_df_sampled['BE_ID']).intersection(set(test_df['BE_ID']))
+    logging.info(f"Number of common users for evaluation: {len(common_users)}")
+
+    if not common_users:
+        logging.error("No common users found between training and test sets. Adjust the sampling percentage or check your data.")
+        return
+
+    # Sample 1000 users from common_users for evaluation
+    sample_size = 1000
+    if len(common_users) >= sample_size:
+        sample_users = random.sample(list(common_users), sample_size)
+    else:
+        sample_users = list(common_users)
+        logging.warning(f"Requested sample size {sample_size} exceeds the number of common users. Evaluating on {len(sample_users)} users.")
+
+    logging.info(f"Number of users selected for evaluation: {len(sample_users)}")
+
+    # Filter test set to include only interactions from sampled users
+    test_df_filtered = test_df[test_df['BE_ID'].isin(sample_users)].reset_index(drop=True)
+    logging.info(f"Number of test data points after filtering sampled users: {len(test_df_filtered)}")
+
     # Use the Reader class to parse the DataFrame
     min_rating = interactions_df['rating'].min()
     max_rating = interactions_df['rating'].max()
     reader = Reader(rating_scale=(min_rating, max_rating))
 
-    # Build full trainset for collaborative filtering
-    full_train_data = Dataset.load_from_df(
-        train_df_full[['BE_ID', 'TITLE_ID', 'rating']],
+    # Build trainset for collaborative filtering
+    train_data = Dataset.load_from_df(
+        train_df_sampled[['BE_ID', 'TITLE_ID', 'rating']],
         reader
     )
 
@@ -105,19 +135,32 @@ def main():
     content_recommender = ContentBasedRecommender(titles_df, count_matrix, algorithm='cosine')
     content_recommender.train()
 
+    # Define Algorithm Type Mappings
+    user_based_algorithms = ['SVD', 'SVDpp', 'NMF']
+    item_based_algorithms = ['KNNBasic', 'KNNWithMeans', 'KNNBaseline']
+
     # Initialize and train collaborative filtering recommenders
     collaborative_recommenders = []
     for algo in algorithms:
-        logging.info(f'Initializing collaborative filtering recommender with algorithm: {algo}')
+        if algo in user_based_algorithms:
+            user_based = True
+        elif algo in item_based_algorithms:
+            user_based = False
+        else:
+            logging.warning(f"Algorithm '{algo}' is not recognized. Skipping.")
+            continue
+
+        logging.info(f'Initializing {"user-based" if user_based else "item-based"} collaborative filtering recommender with algorithm: {algo}')
         collaborative_recommender = CollaborativeFilteringRecommender(
-            data=full_train_data,
+            data=train_data,
             algorithm=algo,
-            algo_params={}  # Empty as hyperparameter tuning is removed
+            algo_params={'sim_options': {'name': 'cosine', 'user_based': user_based}} if not user_based else {},
+            user_based=user_based
         )
         collaborative_recommender.train()
         collaborative_recommenders.append(collaborative_recommender)
 
-    # Initialize and train hybrid recommenders
+    # Initialize and train hybrid recommenders (for all CF algorithms)
     hybrid_recommenders = []
     for collaborative_recommender in collaborative_recommenders:
         logging.info('Initializing hybrid recommender...')
@@ -146,138 +189,95 @@ def main():
 
     # Evaluate Content-Based Recommender
     if 'content' in model_types:
-        logging.info("Evaluating Content-Based Model...")
+        logging.info("Evaluating Content-Based Model on the test set...")
 
-        # Define test titles for evaluation
-        test_titles = ['tm107473', 'tm50355', 'ts89259']
+        for user_id in tqdm(sample_users, desc="Evaluating Content-Based Model"):
+            # Get the items the user interacted with in the test set
+            user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
-        # Create relevant items dictionary (replace with actual relevant TITLE_IDs)
-        relevant_titles_dict = {
-            'tm107473': ['tm1074731', 'tm1074732', 'tm1074733'],  # Replace with actual relevant TITLE_IDs
-            'tm50355': ['tm503551', 'tm503552', 'tm503553'],
-            'ts89259': ['ts892591', 'ts892592', 'ts892593']
-        }
+            if not user_test_items:
+                continue  # Skip users with no test interactions
 
-        avg_precision, avg_recall, avg_f_score = content_recommender.evaluate(
-            test_titles=test_titles,
-            relevant_titles_dict=relevant_titles_dict,
-            top_k=config.TOP_K
-        )
-        logging.info(f"Content-Based Model Evaluation - Precision@K: {avg_precision:.4f}, Recall@K: {avg_recall:.4f}, F-Score@K: {avg_f_score:.4f}")
+            # Get the user's training items
+            user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            if not user_train_items:
+                continue  # Skip users with no training interactions
 
-        for title_id in test_titles:
-            recommendations = content_recommender.get_recommendations(title_id, top_k=config.TOP_K, exclude_items=None)
-            recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
-            logging.info(f"\nContent-Based Recommendations for Title ID '{title_id}':")
-            for title in recommended_titles:
-                logging.info(title)
+            # Assume the last item in training is the representative
+            representative_item = user_train_items[-1]
 
-            # Evaluate individual recommendations if relevant items are provided
-            relevant_items = relevant_titles_dict.get(title_id, [])
-            if relevant_items:
-                precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
-                recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
-                f_score = f_score_at_k(precision, recall)
-                ndcg = ndcg_at_k(recommendations, relevant_items, k=config.TOP_K)
-                diversity = calculate_diversity(recommendations, item_features_dict)
-                novelty = calculate_novelty(recommendations, item_popularity)
-                coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
-                ctr = estimated_ctr(recommendations, relevant_items)
+            # Get recommendations
+            recommendations = content_recommender.get_recommendations(
+                title_id=representative_item,
+                top_k=config.TOP_K,
+                exclude_items=user_train_items,
+                identifier_type='title'
+            )
 
-                logging.info(f"\nContent-Based Recommendations Evaluation for Title ID '{title_id}':")
-                logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
-                logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
-                logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
-                logging.info(f"NDCG@{config.TOP_K}: {ndcg:.4f}")
-                logging.info(f"Diversity: {diversity:.4f}")
-                logging.info(f"Novelty: {novelty:.4f}")
-                logging.info(f"Coverage: {coverage:.4f}")
-                logging.info(f"Estimated CTR: {ctr:.4f}")
+            # Calculate metrics
+            precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
+            recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
+            f_score = f_score_at_k(precision, recall)
+            ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
+            diversity = calculate_diversity(recommendations, item_features_dict)
+            novelty = calculate_novelty(recommendations, item_popularity)
+            coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
+            ctr = estimated_ctr(recommendations, user_test_items)
 
-                # Store results
-                result_entry = {
-                    'Model Type': 'Content-Based',
-                    'Algorithm': 'Cosine Similarity',
-                    'Title ID': title_id,
-                    'Precision@K': precision,
-                    'Recall@K': recall,
-                    'F-Score@K': f_score,
-                    'NDCG@K': ndcg,
-                    'Diversity': diversity,
-                    'Novelty': novelty,
-                    'Coverage': coverage,
-                    'Estimated CTR': ctr
-                }
-
-                results.append(result_entry)
+            # Store results
+            results.append({
+                'Model Type': 'Content-Based',
+                'Algorithm': 'Cosine Similarity',
+                'User ID': user_id,
+                'Precision@K': precision,
+                'Recall@K': recall,
+                'F-Score@K': f_score,
+                'NDCG@K': ndcg,
+                'Diversity': diversity,
+                'Novelty': novelty,
+                'Coverage': coverage,
+                'Estimated CTR': ctr
+            })
 
     # Evaluate Collaborative Filtering Recommender
     if 'collaborative' in model_types:
-        logging.info("Evaluating Collaborative Filtering Model...")
-        # Removed user-based evaluations as per your request
+        logging.info("Evaluating Collaborative Filtering Models on the test set...")
 
-    # Evaluate Hybrid Recommender
-    if 'hybrid' in model_types:
-        logging.info("Evaluating Hybrid Recommender Model...")
+        for collaborative_recommender in collaborative_recommenders:
+            if collaborative_recommender.user_based:
+                # User-Based Collaborative Filtering Evaluation
+                logging.info(f"Evaluating User-Based Collaborative Filtering Model: {collaborative_recommender.algorithm_name}")
 
-        # Define test titles for evaluation
-        test_titles = ['tm107473', 'tm50355', 'ts89259']
+                for user_id in tqdm(sample_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
+                    # Get the items the user interacted with in the test set
+                    user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
-        # Create relevant items dictionary for test titles (replace with actual relevant TITLE_IDs)
-        relevant_titles_dict = {
-            'tm107473': ['tm1074731', 'tm1074732', 'tm1074733'],  # Replace with actual relevant TITLE_IDs
-            'tm50355': ['tm503551', 'tm503552', 'tm503553'],
-            'ts89259': ['ts892591', 'ts892592', 'ts892593']
-        }
+                    if not user_test_items:
+                        continue  # Skip users with no test interactions
 
-        for hybrid_recommender in hybrid_recommenders:
-            avg_precision, avg_recall, avg_f_score = hybrid_recommender.evaluate(
-                identifiers=test_titles,
-                relevant_items_dict=relevant_titles_dict,
-                top_k=config.TOP_K,
-                identifier_type='title'
-            )
-            logging.info(f"Hybrid Recommender Model Evaluation - Precision@K: {avg_precision:.4f}, Recall@K: {avg_recall:.4f}, F-Score@K: {avg_f_score:.4f}")
+                    # Get recommendations
+                    recommendations = collaborative_recommender.get_recommendations(
+                        identifier=user_id,
+                        top_k=config.TOP_K,
+                        exclude_items=None,
+                        identifier_type='user'
+                    )
 
-            for title_id in test_titles:
-                recommendations = hybrid_recommender.get_recommendations(
-                    identifier=title_id,
-                    top_k=config.TOP_K,
-                    exclude_items=None,
-                    identifier_type='title'
-                )
-                recommended_titles = [title_id_to_title.get(item_id, item_id) for item_id in recommendations]
-                logging.info(f"\nHybrid Recommendations for Title ID '{title_id}':")
-                for title in recommended_titles:
-                    logging.info(title)
-
-                # Evaluate individual recommendations if relevant items are provided
-                relevant_items = relevant_titles_dict.get(title_id, [])
-                if relevant_items:
-                    precision = precision_at_k(recommendations, relevant_items, k=config.TOP_K)
-                    recall = recall_at_k(recommendations, relevant_items, k=config.TOP_K)
+                    # Calculate metrics
+                    precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
+                    recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
                     f_score = f_score_at_k(precision, recall)
-                    ndcg = ndcg_at_k(recommendations, relevant_items, k=config.TOP_K)
+                    ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
                     diversity = calculate_diversity(recommendations, item_features_dict)
                     novelty = calculate_novelty(recommendations, item_popularity)
                     coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
-                    ctr = estimated_ctr(recommendations, relevant_items)
-
-                    logging.info(f"\nHybrid Recommendations Evaluation for Title ID '{title_id}':")
-                    logging.info(f"Precision@{config.TOP_K}: {precision:.4f}")
-                    logging.info(f"Recall@{config.TOP_K}: {recall:.4f}")
-                    logging.info(f"F-Score@{config.TOP_K}: {f_score:.4f}")
-                    logging.info(f"NDCG@{config.TOP_K}: {ndcg:.4f}")
-                    logging.info(f"Diversity: {diversity:.4f}")
-                    logging.info(f"Novelty: {novelty:.4f}")
-                    logging.info(f"Coverage: {coverage:.4f}")
-                    logging.info(f"Estimated CTR: {ctr:.4f}")
+                    ctr = estimated_ctr(recommendations, user_test_items)
 
                     # Store results
-                    result_entry = {
-                        'Model Type': 'Hybrid',
-                        'Algorithm': 'Content + Collaborative',
-                        'Title ID': title_id,
+                    results.append({
+                        'Model Type': 'Collaborative Filtering',
+                        'Algorithm': collaborative_recommender.algorithm_name,
+                        'User ID': user_id,
                         'Precision@K': precision,
                         'Recall@K': recall,
                         'F-Score@K': f_score,
@@ -286,17 +286,121 @@ def main():
                         'Novelty': novelty,
                         'Coverage': coverage,
                         'Estimated CTR': ctr
-                    }
+                    })
+            else:
+                # Item-Based Collaborative Filtering Evaluation
+                logging.info(f"Evaluating Item-Based Collaborative Filtering Model: {collaborative_recommender.algorithm_name}")
 
-                    results.append(result_entry)
+                for user_id in tqdm(sample_users, desc=f"Evaluating {collaborative_recommender.algorithm_name}"):
+                    # Get the items the user interacted with in the test set
+                    user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
-    # Create a DataFrame to display results
+                    if not user_test_items:
+                        continue  # Skip users with no test interactions
+
+                    # Get the user's training items
+                    user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                    if not user_train_items:
+                        continue  # Skip users with no training interactions
+
+                    # Assume the last item in training is the representative
+                    representative_item = user_train_items[-1]
+
+                    # Get recommendations
+                    recommendations = collaborative_recommender.get_recommendations(
+                        identifier=representative_item,
+                        top_k=config.TOP_K,
+                        exclude_items=user_train_items,
+                        identifier_type='title'
+                    )
+
+                    # Calculate metrics
+                    precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
+                    recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
+                    f_score = f_score_at_k(precision, recall)
+                    ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
+                    diversity = calculate_diversity(recommendations, item_features_dict)
+                    novelty = calculate_novelty(recommendations, item_popularity)
+                    coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
+                    ctr = estimated_ctr(recommendations, user_test_items)
+
+                    # Store results
+                    results.append({
+                        'Model Type': 'Collaborative Filtering',
+                        'Algorithm': collaborative_recommender.algorithm_name,
+                        'User ID': user_id,
+                        'Precision@K': precision,
+                        'Recall@K': recall,
+                        'F-Score@K': f_score,
+                        'NDCG@K': ndcg,
+                        'Diversity': diversity,
+                        'Novelty': novelty,
+                        'Coverage': coverage,
+                        'Estimated CTR': ctr
+                    })
+
+    # Evaluate Hybrid Recommender
+    if 'hybrid' in model_types:
+        logging.info("Evaluating Hybrid Recommender Models on the test set...")
+
+        for hybrid_recommender in hybrid_recommenders:
+            for user_id in tqdm(sample_users, desc="Evaluating Hybrid Recommender"):
+                # Get the items the user interacted with in the test set
+                user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
+
+                if not user_test_items:
+                    continue  # Skip users with no test interactions
+
+                # Get the user's training items
+                user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+                if not user_train_items:
+                    continue  # Skip users with no training interactions
+
+                # Assume the last item in training is the representative
+                representative_item = user_train_items[-1]
+
+                # Get recommendations
+                recommendations = hybrid_recommender.get_recommendations(
+                    identifier=user_id,
+                    top_k=config.TOP_K,
+                    exclude_items=user_train_items,
+                    identifier_type='user'
+                )
+
+                # Calculate metrics
+                precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
+                recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
+                f_score = f_score_at_k(precision, recall)
+                ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
+                diversity = calculate_diversity(recommendations, item_features_dict)
+                novelty = calculate_novelty(recommendations, item_popularity)
+                coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
+                ctr = estimated_ctr(recommendations, user_test_items)
+
+                # Store results
+                results.append({
+                    'Model Type': 'Hybrid',
+                    'Algorithm': 'Content + Collaborative',
+                    'User ID': user_id,
+                    'Precision@K': precision,
+                    'Recall@K': recall,
+                    'F-Score@K': f_score,
+                    'NDCG@K': ndcg,
+                    'Diversity': diversity,
+                    'Novelty': novelty,
+                    'Coverage': coverage,
+                    'Estimated CTR': ctr
+                })
+
+    # Create DataFrame to display results
     if results:
         results_df = pd.DataFrame(results)
-        results_df = results_df.sort_values('NDCG@K', ascending=False)
+        # Compute average metrics across all users (only numeric columns)
+        numeric_cols = ['Precision@K', 'Recall@K', 'F-Score@K', 'NDCG@K', 'Diversity', 'Novelty', 'Coverage', 'Estimated CTR']
+        average_metrics = results_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
+        logging.info('\nAverage Recommendations Evaluation Results:')
+        logging.info('\n' + average_metrics.to_string(index=False))
 
-        logging.info('\nModel Ranking Based on NDCG@K:')
-        logging.info('\n' + results_df.to_string(index=False))
     else:
         logging.info("No evaluation results to display.")
 

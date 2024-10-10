@@ -3,98 +3,148 @@
 import logging
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
-from src import config
-from src.models.evaluation import precision_at_k, recall_at_k, f_score_at_k
-from scipy.sparse import csr_matrix
-
+from src.models.evaluation import (
+    precision_at_k, recall_at_k, f_score_at_k, ndcg_at_k,
+    calculate_diversity, calculate_novelty, estimated_ctr,
+    calculate_coverage
+)
+import numpy as np
 
 class ContentBasedRecommender:
-    def __init__(self, titles_df, feature_matrix, algorithm='cosine'):
+    def __init__(self, titles_df: pd.DataFrame, count_matrix, algorithm='cosine'):
         """
-        Initializes the content-based recommender system.
-
-        Parameters:
-        - titles_df: DataFrame containing title information.
-        - feature_matrix: Sparse matrix representing item features.
-        - algorithm: Similarity algorithm to use (default: 'cosine').
+        Initializes the content-based recommender.
         """
-        self.titles_df = titles_df.reset_index(drop=True)
-        self.feature_matrix = feature_matrix.tocsr()  # Ensure CSR format
-        self.title_ids = self.titles_df['TITLE_ID'].tolist()
-        self.similarity_algorithm = algorithm
-        self.item_similarity = None  # To be computed during training
+        self.titles_df = titles_df
+        self.count_matrix = count_matrix
+        self.algorithm = algorithm
+        self.similarity_matrix = None
+        self.trained = False
 
     def train(self):
         """
-        Trains the content-based recommender by computing the item similarity matrix.
+        Computes the similarity matrix using the specified algorithm.
         """
         logging.info("Training Content-Based Recommender...")
-        # Normalize the feature matrix
-        normalized_features = normalize(self.feature_matrix, axis=1, norm='l2', copy=False)
-        # Compute cosine similarity
-        self.item_similarity = cosine_similarity(normalized_features, normalized_features)
+        if self.algorithm == 'cosine':
+            self.similarity_matrix = cosine_similarity(self.count_matrix)
+        else:
+            raise ValueError(f"Algorithm '{self.algorithm}' is not supported.")
+        self.trained = True
         logging.info("Content-Based Recommender training complete.")
 
-    def get_recommendations(self, title_id, top_k=config.TOP_K, exclude_items=None):
+    def get_recommendations(self, title_id, top_k=10, exclude_items=None, identifier_type='title'):
         """
-        Recommends top K similar items to the given title_id.
-
-        Parameters:
-        - title_id: The TITLE_ID for which to find similar items.
-        - top_k: The number of recommendations to generate.
-        - exclude_items: A list of TITLE_IDs to exclude from recommendations.
-
-        Returns:
-        - A list of recommended TITLE_IDs.
+        Generates top K recommendations for a given title.
         """
-        if self.item_similarity is None:
-            logging.error("Model has not been trained. Call train() before getting recommendations.")
+        if not self.trained:
+            self.train()
+
+        if title_id not in self.titles_df['TITLE_ID'].values:
+            logging.warning(f"Title ID {title_id} not found in the dataset.")
             return []
 
-        if title_id not in self.title_ids:
-            logging.error(f"Title ID {title_id} not found in the dataset.")
-            return []
+        idx = self.titles_df[self.titles_df['TITLE_ID'] == title_id].index[0]
+        sim_scores = list(enumerate(self.similarity_matrix[idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        sim_scores = sim_scores[1:top_k+1]  # Exclude the title itself
 
-        # Get the index of the given title_id
-        idx = self.title_ids.index(title_id)
-        # Get similarity scores for all items with the given item
-        sim_scores = self.item_similarity[idx]
-        # Create a Series with TITLE_ID as index
-        similarity_scores = pd.Series(sim_scores, index=self.title_ids)
-        # Exclude specified items
-        if exclude_items and len(exclude_items) > 0:
-            similarity_scores = similarity_scores.drop(exclude_items, errors='ignore')
-        # Get top K items
-        top_k_items = similarity_scores.nlargest(top_k).index.tolist()
-        return top_k_items
+        recommended_indices = [i[0] for i in sim_scores]
+        recommended_titles = self.titles_df.iloc[recommended_indices]['TITLE_ID'].tolist()
 
-    def evaluate(self, test_titles, relevant_titles_dict, top_k=config.TOP_K):
+        if exclude_items:
+            recommended_titles = [title for title in recommended_titles if title not in exclude_items]
+
+        return recommended_titles[:top_k]
+
+    def evaluate(self, identifiers, test_df_filtered, top_k=10, identifier_type='user', item_features_dict=None, item_popularity=None, titles_df=None):
         """
-        Evaluates the content-based recommender using precision, recall, and F-score.
+        Evaluates the content-based recommender using multiple metrics.
 
         Parameters:
-        - test_titles: List of TITLE_IDs to evaluate on.
-        - relevant_titles_dict: Dictionary where keys are TITLE_IDs and values are lists of relevant TITLE_IDs.
+        - identifiers: List of USER_IDs to evaluate.
+        - test_df_filtered: The filtered test DataFrame containing interactions for common users.
         - top_k: Number of recommendations to evaluate.
+        - identifier_type: Type of the identifiers ('user').
+        - item_features_dict: Dictionary mapping ITEM_ID to feature vectors.
+        - item_popularity: Dictionary mapping ITEM_ID to popularity counts.
+        - titles_df: DataFrame containing all titles.
 
         Returns:
-        - Tuple of average precision, recall, and F-score.
+        - Dictionary containing average metrics.
         """
         precisions = []
         recalls = []
+        f_scores = []
+        ndcgs = []
+        diversities = []
+        novelties = []
+        coverages = []
+        ctrs = []
 
-        for title_id in test_titles:
-            relevant_items = relevant_titles_dict.get(title_id, [])
-            recommendations = self.get_recommendations(title_id, top_k=top_k, exclude_items=None)
+        for user_id in identifiers:
+            # Get the items the user interacted with in the test set
+            user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
-            precision = precision_at_k(recommendations, relevant_items, k=top_k)
-            recall = recall_at_k(recommendations, relevant_items, k=top_k)
+            if not user_test_items:
+                continue  # Skip users with no test interactions
+
+            # Get the user's training items
+            user_train_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            # Note: Since we're evaluating on test interactions, use representative from training
+            # Assuming the last interacted item in training is the representative
+
+            # To get representative item, find last item in training interactions
+            user_training_interactions = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            if not user_training_interactions:
+                continue  # Skip users with no training interactions
+
+            representative_item = user_training_interactions[-1]
+
+            # Get recommendations
+            recommendations = self.get_recommendations(
+                title_id=representative_item,
+                top_k=top_k,
+                exclude_items=user_training_interactions,
+                identifier_type=identifier_type
+            )
+
+            # Calculate metrics
+            precision = precision_at_k(recommendations, user_test_items, k=top_k)
+            recall = recall_at_k(recommendations, user_test_items, k=top_k)
+            f_score = f_score_at_k(precision, recall)
+            ndcg = ndcg_at_k(recommendations, user_test_items, k=top_k)
+            diversity = calculate_diversity(recommendations, item_features_dict)
+            novelty = calculate_novelty(recommendations, item_popularity)
+            coverage = calculate_coverage(recommendations, titles_df['TITLE_ID'].unique())
+            ctr = estimated_ctr(recommendations, user_test_items)
+
+            # Append metrics
             precisions.append(precision)
             recalls.append(recall)
+            f_scores.append(f_score)
+            ndcgs.append(ndcg)
+            diversities.append(diversity)
+            novelties.append(novelty)
+            coverages.append(coverage)
+            ctrs.append(ctr)
 
         avg_precision = sum(precisions) / len(precisions) if precisions else 0.0
         avg_recall = sum(recalls) / len(recalls) if recalls else 0.0
-        avg_f_score = f_score_at_k(avg_precision, avg_recall)
+        avg_f_score = sum(f_scores) / len(f_scores) if f_scores else 0.0
+        avg_ndcg = sum(ndcgs) / len(ndcgs) if ndcgs else 0.0
+        avg_diversity = sum(diversities) / len(diversities) if diversities else 0.0
+        avg_novelty = sum(novelties) / len(novelties) if novelties else 0.0
+        avg_coverage = sum(coverages) / len(coverages) if coverages else 0.0
+        avg_ctr = sum(ctrs) / len(ctrs) if ctrs else 0.0
 
-        return avg_precision, avg_recall, avg_f_score
+        return {
+            'Precision@K': avg_precision,
+            'Recall@K': avg_recall,
+            'F-Score@K': avg_f_score,
+            'NDCG@K': avg_ndcg,
+            'Diversity': avg_diversity,
+            'Novelty': avg_novelty,
+            'Coverage': avg_coverage,
+            'Estimated CTR': avg_ctr
+        }
