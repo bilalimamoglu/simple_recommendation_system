@@ -2,17 +2,19 @@
 
 import logging
 from surprise import KNNBaseline, SVD, SVDpp, NMF, Dataset
+from surprise import accuracy
+from src.models.recommender import Recommender
 from src import config
-import numpy as np
 
-class CollaborativeFilteringRecommender:
+
+class CollaborativeFilteringRecommender(Recommender):
     def __init__(self, data, algorithm='SVD', algo_params=None, user_based=True):
         """
         Initializes the collaborative filtering model using the Surprise library.
 
         Parameters:
         - data: The Dataset object from Surprise.
-        - algorithm: Name of the algorithm to use.
+        - algorithm: Name of the algorithm to use (e.g., 'SVD', 'KNNBaseline').
         - algo_params: Dictionary of algorithm-specific hyperparameters.
         - user_based: Boolean flag indicating whether to perform user-based (True) or item-based (False) CF.
         """
@@ -56,34 +58,34 @@ class CollaborativeFilteringRecommender:
         """
         Trains the collaborative filtering model.
         """
-        logging.info(f"Training Collaborative Filtering model using {self.algorithm_name} ({'User-Based' if self.user_based else 'Item-Based'})...")
+        logging.info(
+            f"Training Collaborative Filtering model using {self.algorithm_name} ({'User-Based' if self.user_based else 'Item-Based'})...")
         self.trainset = self.data.build_full_trainset()
         self.algo.fit(self.trainset)
         self.trained = True
         logging.info("Collaborative Filtering model training complete.")
 
-    def get_recommendations(self, identifier, top_k=config.TOP_K, exclude_items=None, identifier_type='user'):
+    def get_recommendations(self, identifier, top_k=10, exclude_items=None, identifier_type='user'):
         """
         Generates top K recommendations based on the identifier type.
 
         Parameters:
-        - identifier: TITLE_ID (for item-based) or USER_ID (for user-based) for whom to generate recommendations.
-        - top_k: The number of recommendations to generate.
-        - exclude_items: A list of item IDs to exclude from recommendations.
-        - identifier_type: Type of the identifier ('title' or 'user').
+        - identifier: USER_ID (for user-based) or TITLE_ID (for item-based) for whom to generate recommendations.
+        - top_k: Number of recommendations to generate.
+        - exclude_items: List of item IDs to exclude from recommendations.
+        - identifier_type: Type of the identifier ('user' or 'title').
 
         Returns:
-        - A list of recommended TITLE_IDs.
+        - List of recommended TITLE_IDs.
         """
         if not self.trained:
             self.train()
 
-        if identifier_type == 'user' and self.user_based:
+        if self.user_based and identifier_type == 'user':
             # User-Based Collaborative Filtering
             user_id = identifier
-            # Check if user_id exists in the training set
             if user_id not in self.trainset._raw2inner_id_users:
-                logging.warning(f"User ID {user_id} is not in the training set.")
+                logging.warning(f"User ID {user_id} not in the training set.")
                 return []
 
             # Get all items in the training set as inner IDs
@@ -106,6 +108,33 @@ class CollaborativeFilteringRecommender:
 
             return top_k_items
 
+        elif not self.user_based and identifier_type == 'title':
+            # Item-Based Collaborative Filtering
+            title_id = identifier
+            if title_id not in self.trainset._raw2inner_id_items:
+                logging.warning(f"Title ID {title_id} not in the training set.")
+                return []
+
+            # Get inner ID for the given title_id
+            inner_id = self.trainset.to_inner_iid(title_id)
+
+            # Get top K neighbors
+            try:
+                neighbors = self.algo.get_neighbors(inner_id, k=top_k + (len(exclude_items) if exclude_items else 0))
+            except AttributeError:
+                logging.error(f"The algorithm '{self.algorithm_name}' does not support 'get_neighbors' method.")
+                return []
+
+            # Convert inner IDs back to raw IDs
+            recommended_items = [self.trainset.to_raw_iid(inner_id) for inner_id in neighbors]
+
+            # Exclude specified items
+            if exclude_items:
+                recommended_items = [item for item in recommended_items if item not in exclude_items]
+
+            # Return top_k items
+            return recommended_items[:top_k]
+
         else:
-            logging.error(f"Identifier type mismatch or unsupported combination: identifier_type={identifier_type}, user_based={self.user_based}")
+            logging.error(f"Unsupported identifier_type '{identifier_type}' for algorithm '{self.algorithm_name}'.")
             return []

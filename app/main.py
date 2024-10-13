@@ -7,34 +7,33 @@ import pandas as pd
 from surprise import Dataset, Reader
 from tqdm import tqdm  # For progress bars
 import random
-from sklearn.model_selection import StratifiedShuffleSplit  # For stratified sampling
 
 import sys
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.logger import setup_logging
 from app.parser import parse_arguments
-from app.utils import set_seed
+from app.utils import set_seed, save_model, load_model
 from src import config
-from src.data_processing import (
-    load_data, clean_titles_data, clean_interactions_data,
-    save_processed_data, load_processed_data
-)
-from src.feature_engineering import process_text_features, create_count_matrix
+from src.data_processing.load_data import load_data
+from src.data_processing.preprocess import clean_titles_data, clean_interactions_data
+from src.feature_engineering.feature_engineer import process_text_features, create_count_matrix
 from src.models.content_based import ContentBasedRecommender
 from src.models.collaborative_filtering import CollaborativeFilteringRecommender
 from src.models.hybrid_model import HybridRecommender
-from src.models.evaluation import (
+from src.evaluation.metrics import (
     precision_at_k, recall_at_k, f_score_at_k, ndcg_at_k, mean_average_precision,
     area_under_roc_curve, coverage_at_k
 )
-from sklearn.decomposition import TruncatedSVD
 
-setup_logging()
-set_seed()
 
 def main():
-    # Parse arguments
+    # Setup logging and set seed
+    setup_logging()
+    set_seed()
+
+    # Parse command-line arguments
     args = parse_arguments()
     algorithms = [alg.strip() for alg in args.algorithms.split(',')]
 
@@ -42,20 +41,22 @@ def main():
     config.TOP_K = args.top_k
     config.ALPHA = args.alpha  # Ensure ALPHA is set in config if used elsewhere
 
-    # Load or preprocess data
-    if os.path.exists(config.PROCESSED_TITLES_PATH) and os.path.exists(config.PROCESSED_INTERACTIONS_PATH):
-        logging.info('Loading preprocessed data...')
-        titles_df, interactions_df = load_processed_data()
-    else:
-        logging.info('Loading raw data...')
-        titles_df, interactions_df = load_data()
+    # Load raw data
+    logging.info('Loading raw data...')
+    titles_df, interactions_df = load_data()
 
-        logging.info('Preprocessing data...')
-        titles_df = clean_titles_data(titles_df)
-        interactions_df = clean_interactions_data(interactions_df)
+    # Preprocess data
+    logging.info('Preprocessing data...')
+    titles_df = clean_titles_data(titles_df)
+    interactions_df = clean_interactions_data(interactions_df)
 
-        save_processed_data(titles_df, interactions_df)
+    # Save processed data
+    logging.info('Saving processed data...')
+    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+    titles_df.to_csv(config.PROCESSED_TITLES_PATH, index=False)
+    interactions_df.to_csv(config.PROCESSED_INTERACTIONS_PATH, index=False)
 
+    # Feature Engineering
     logging.info('Performing feature engineering...')
     titles_df = process_text_features(titles_df)
     tfidf_matrix_svd, vectorizer, svd = create_count_matrix(titles_df, max_features=args.max_features)
@@ -81,7 +82,7 @@ def main():
     # Sort interactions by timestamp
     interactions_df = interactions_df.sort_values('COLLECTOR_TSTAMP').reset_index(drop=True)
 
-    # Split into training and test sets chronologically
+    # Time-wise train-test split
     logging.info('Splitting data into train and test sets chronologically...')
     cutoff_date = pd.to_datetime('2024-06-30', utc=True)
     train_df_full = interactions_df[interactions_df['COLLECTOR_TSTAMP'] < cutoff_date].reset_index(drop=True)
@@ -94,7 +95,7 @@ def main():
     if args.sample_percentage < 100.0:
         logging.info(f"Sampling {args.sample_percentage}% of training data...")
         train_df_sampled = train_df_full.sample(frac=args.sample_percentage / 100.0,
-                                               random_state=config.RANDOM_STATE).reset_index(drop=True)
+                                                random_state=config.RANDOM_STATE).reset_index(drop=True)
     else:
         train_df_sampled = train_df_full.copy()
 
@@ -107,7 +108,8 @@ def main():
     logging.info(f"Number of common users for evaluation: {len(common_users)}")
 
     if not common_users:
-        logging.error("No common users found between training and test sets. Adjust the sample percentage or check your data.")
+        logging.error(
+            "No common users found between training and test sets. Adjust the sample percentage or check your data.")
         return
 
     # Perform stratified sampling among common users
@@ -121,12 +123,14 @@ def main():
     # Define number of strata (e.g., 5 bins)
     n_strata = 5
     try:
-        user_interaction_counts['interaction_bin'] = pd.qcut(user_interaction_counts['interaction_count'], q=n_strata, labels=False, duplicates='drop')
+        user_interaction_counts['interaction_bin'] = pd.qcut(user_interaction_counts['interaction_count'], q=n_strata,
+                                                             labels=False, duplicates='drop')
     except ValueError as e:
         logging.warning(f"Stratified sampling encountered an issue: {e}. Falling back to uniform sampling.")
         sampled_users = random.sample(list(common_users), min(1000, len(common_users)))
     else:
         # Initialize StratifiedShuffleSplit
+        from sklearn.model_selection import StratifiedShuffleSplit
         splitter = StratifiedShuffleSplit(n_splits=1, test_size=1000, random_state=config.RANDOM_STATE)
         for train_idx, test_idx in splitter.split(user_interaction_counts, user_interaction_counts['interaction_bin']):
             sampled_users = user_interaction_counts.iloc[test_idx]['BE_ID'].tolist()
@@ -138,9 +142,7 @@ def main():
     logging.info(f"Number of test data points after filtering sampled users: {len(test_df_filtered)}")
 
     # Use the Reader class to parse the DataFrame
-    min_rating = interactions_df['rating'].min()
-    max_rating = interactions_df['rating'].max()
-    reader = Reader(rating_scale=(min_rating, max_rating))
+    reader = Reader(rating_scale=(interactions_df['rating'].min(), interactions_df['rating'].max()))
 
     # Build trainset for collaborative filtering
     train_data = Dataset.load_from_df(
@@ -159,7 +161,7 @@ def main():
 
     # Define Algorithm Type Mappings
     user_based_algorithms = ['SVD', 'SVDpp', 'NMF']
-    item_based_algorithms = ['KNNBasic', 'KNNWithMeans', 'KNNBaseline']
+    item_based_algorithms = ['KNNBaseline', 'KNNBasic', 'KNNWithMeans']
 
     # Initialize and train collaborative filtering recommenders
     collaborative_recommenders = []
@@ -172,7 +174,8 @@ def main():
             logging.warning(f"Algorithm '{algo}' is not recognized. Skipping.")
             continue
 
-        logging.info(f'Initializing {"user-based" if user_based else "item-based"} collaborative filtering recommender with algorithm: {algo}')
+        logging.info(
+            f'Initializing {"user-based" if user_based else "item-based"} collaborative filtering recommender with algorithm: {algo}')
         collaborative_recommender = CollaborativeFilteringRecommender(
             data=train_data,
             algorithm=algo,
@@ -222,7 +225,8 @@ def main():
         recommendations = content_recommender.get_recommendations(
             title_id=representative_item,
             top_k=config.TOP_K,
-            exclude_items=user_train_items
+            exclude_items=user_train_items,
+            identifier_type='title'
         )
 
         # Calculate metrics
@@ -354,8 +358,28 @@ def main():
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
         results_df.to_csv(results_output_path, index=False)
         logging.info(f"Detailed evaluation results saved to {results_output_path}")
+
     else:
         logging.info("No evaluation results to display.")
+
+    # Optionally, save trained models
+    # Example: save_model(content_recommender, 'content_based')
+    #          save_model(collaborative_recommender, 'SVD')
+    #          save_model(hybrid_recommender, 'hybrid_svd')
+    # Uncomment and modify as needed
+
+    if collaborative_recommenders:
+        for cf_recommender in collaborative_recommenders:
+            save_model(cf_recommender.algo, cf_recommender.algorithm_name)
+
+    if hybrid_recommenders:
+        for hybrid_recommender in hybrid_recommenders:
+            hybrid_model_name = f"hybrid_{hybrid_recommender.collaborative_recommender.algorithm_name}"
+            save_model(hybrid_recommender, hybrid_model_name)
+
+    # Save content-based model
+    save_model(content_recommender, 'content_based')
+
 
 if __name__ == '__main__':
     main()

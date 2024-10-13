@@ -1,11 +1,12 @@
 # src/models/content_based.py
 
 import logging
-import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+from src.models.recommender import Recommender
+import pandas as pd
 
-class ContentBasedRecommender:
+
+class ContentBasedRecommender(Recommender):
     def __init__(self, titles_df: pd.DataFrame, tfidf_matrix_svd, idx_to_title_id):
         """
         Initializes the content-based recommender.
@@ -30,7 +31,7 @@ class ContentBasedRecommender:
         self.trained = True
         logging.info("Content-Based Recommender training complete.")
 
-    def get_recommendations(self, title_id, top_k=10, exclude_items=None):
+    def get_recommendations(self, title_id, top_k=10, exclude_items=None, identifier_type='title'):
         """
         Generates top K recommendations for a given title.
 
@@ -38,12 +39,17 @@ class ContentBasedRecommender:
         - title_id: TITLE_ID for which to generate recommendations.
         - top_k: Number of recommendations to generate.
         - exclude_items: List of TITLE_IDs to exclude from recommendations.
+        - identifier_type: Type of the identifier ('title').
 
         Returns:
         - List of recommended TITLE_IDs.
         """
         if not self.trained:
             self.train()
+
+        if identifier_type != 'title':
+            logging.error("ContentBasedRecommender only supports identifier_type='title'.")
+            return []
 
         if title_id not in self.titles_df['TITLE_ID'].values:
             logging.warning(f"Title ID {title_id} not found in the dataset.")

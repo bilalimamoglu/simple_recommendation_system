@@ -1,9 +1,7 @@
 # ui/dashboard_app.py
 
 import streamlit as st
-import pandas as pd
-from src import config
-from src.data_processing import load_data, clean_titles_data
+from src.data_processing.load_data import load_data, clean_titles_data
 from src.feature_engineering import process_text_features, create_count_matrix
 from src.models.content_based import ContentBasedRecommender
 

@@ -1,7 +1,8 @@
-# src/models/evaluation.py
+# src/evaluation/metrics.py
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
+
 
 def precision_at_k(recommended_items, relevant_items, k):
     """
@@ -14,6 +15,7 @@ def precision_at_k(recommended_items, relevant_items, k):
     precision = len(intersection) / k
     return precision
 
+
 def recall_at_k(recommended_items, relevant_items, k):
     """
     Calculates Recall@K.
@@ -25,11 +27,13 @@ def recall_at_k(recommended_items, relevant_items, k):
     recall = len(intersection) / len(relevant_set) if len(relevant_set) > 0 else 0.0
     return recall
 
+
 def f_score_at_k(precision, recall):
     """
     Calculates F1-Score@K.
     """
     return 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
 
 def ndcg_at_k(recommended_items, relevant_items, k):
     """
@@ -42,6 +46,7 @@ def ndcg_at_k(recommended_items, relevant_items, k):
     idcg = sum([1 / np.log2(i + 2) for i in range(min(len(relevant_items), k))])
     ndcg = dcg / idcg if idcg > 0 else 0.0
     return ndcg
+
 
 def mean_average_precision(recommended_items, relevant_items):
     """
@@ -56,6 +61,7 @@ def mean_average_precision(recommended_items, relevant_items):
     map_score = ap_sum / len(relevant_items) if relevant_items else 0.0
     return map_score
 
+
 def area_under_roc_curve(recommended_items, relevant_items, all_items):
     """
     Calculates Area Under the ROC Curve (AUC).
@@ -67,6 +73,7 @@ def area_under_roc_curve(recommended_items, relevant_items, all_items):
     except ValueError:
         auc = 0.0
     return auc
+
 
 def coverage_at_k(recommended_items, all_items):
     """
