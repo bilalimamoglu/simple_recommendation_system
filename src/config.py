@@ -15,6 +15,8 @@ INTERACTIONS_PATH = os.path.join(RAW_DATA_DIR, 'interactions.csv')
 PROCESSED_TITLES_PATH = os.path.join(PROCESSED_DATA_DIR, 'titles_processed.csv')
 PROCESSED_INTERACTIONS_PATH = os.path.join(PROCESSED_DATA_DIR, 'interactions_processed.csv')
 
+OUTPUT_DIR= os.path.join(DATA_DIR, 'results.csv')
+
 # Model parameters
 TOP_K = 10  # Number of recommendations
 INTERACTION_WEIGHTS = {
