@@ -255,10 +255,10 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
         hybrid_recommenders.append(hybrid_recommender)
         recommenders[f'hybrid_{collaborative_recommender.algorithm_name}'] = hybrid_recommender
 
-    return recommenders
+    return recommenders, sampled_users
 
 
-def evaluate_recommenders(recommenders, interactions_df, titles_df, args):
+def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_users, args):
     """
     Evaluates all recommenders and aggregates the results.
 
@@ -266,16 +266,20 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, args):
     - recommenders: Dictionary containing all trained recommender instances.
     - interactions_df: Preprocessed interactions DataFrame.
     - titles_df: Preprocessed titles DataFrame.
+    - sampled_users: List of user IDs to evaluate.
     - args: Parsed command-line arguments.
 
     Returns:
     - results_df: DataFrame containing evaluation metrics for all recommenders.
     """
-    # Extract sampled users from the interactions
-    cutoff_date = pd.to_datetime('2024-06-30', utc=True)
-    test_df = interactions_df[interactions_df['COLLECTOR_TSTAMP'] >= cutoff_date].reset_index(drop=True)
+    logging.info("Starting evaluation of recommenders...")
 
-    sampled_users = test_df['BE_ID'].unique()
+    # Filter test data for sampled users
+    cutoff_date = pd.to_datetime('2024-06-30', utc=True)
+    test_df_filtered = interactions_df[
+        (interactions_df['BE_ID'].isin(sampled_users)) &
+        (interactions_df['COLLECTOR_TSTAMP'] >= cutoff_date)
+        ].reset_index(drop=True)
 
     # Prepare item popularity for coverage calculation
     all_items = titles_df['TITLE_ID'].unique()
@@ -287,7 +291,7 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, args):
         logging.info(f"Evaluating {model_key}...")
         for user_id in tqdm(sampled_users, desc=f"Evaluating {model_key}"):
             # Get the items the user interacted with in the test set
-            user_test_items = test_df[test_df['BE_ID'] == user_id]['TITLE_ID'].tolist()
+            user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
             if not user_test_items:
                 continue  # Skip users with no test interactions
@@ -301,11 +305,7 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, args):
             # Get recommendations
             if isinstance(recommender, ContentBasedRecommender) or isinstance(recommender,
                                                                               WeightedContentBasedRecommender):
-                if isinstance(recommender, ContentBasedRecommender):
-                    identifier_type = 'title'
-                else:
-                    identifier_type = 'title'
-                # Assume the last item in training is the representative
+                identifier_type = 'title'
                 if train_user_items:
                     representative_item = train_user_items[-1]
                     recommendations = recommender.get_recommendations(

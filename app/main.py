@@ -33,13 +33,13 @@ def main():
     tfidf_matrix_svd, weighted_tfidf_matrix_svd = perform_feature_engineering(titles_df, args)
 
     # Initialize and train recommenders
-    recommenders = initialize_and_train_recommenders(
+    recommenders, sampled_users = initialize_and_train_recommenders(
         titles_df, interactions_df, tfidf_matrix_svd, weighted_tfidf_matrix_svd, args
     )
 
     # Evaluate recommenders
     evaluation_results = evaluate_recommenders(
-        recommenders, interactions_df, titles_df, args
+        recommenders, interactions_df, titles_df, sampled_users, args
     )
 
     # Save evaluation results
