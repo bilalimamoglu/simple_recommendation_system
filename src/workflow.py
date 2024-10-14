@@ -378,8 +378,15 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     # Create DataFrame from results
     results_df = pd.DataFrame(results)
 
+    # Define numeric columns for averaging
+    numeric_cols = ['Precision@K', 'Recall@K', 'F1-Score@K', 'nDCG@K', 'MAP@K', 'AUC', 'Coverage@K']
+
+    # Ensure that the metric columns are numeric
+    for col in numeric_cols:
+        results_df[col] = pd.to_numeric(results_df[col], errors='coerce')
+
     # Compute average metrics across all users
-    average_metrics = results_df.groupby(['Model Type', 'Algorithm']).mean().reset_index()
+    average_metrics = results_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
     logging.info('\nAverage Recommendations Evaluation Results:')
     logging.info('\n' + average_metrics.to_string(index=False))
 

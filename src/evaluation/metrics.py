@@ -4,16 +4,13 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 
-def precision_at_k(recommended_items, relevant_items, k):
-    """
-    Calculates Precision@K.
-    """
-    recommended_k = recommended_items[:k]
+def precision_at_k(recommended_items, relevant_items, k=10):
+    recommended_at_k = recommended_items[:k]
     relevant_set = set(relevant_items)
-    recommended_set = set(recommended_k)
-    intersection = recommended_set.intersection(relevant_set)
-    precision = len(intersection) / k
-    return precision
+    recommended_set = set(recommended_at_k)
+    precision = len(recommended_set & relevant_set) / k
+    return float(precision)
+
 
 
 def recall_at_k(recommended_items, relevant_items, k):
