@@ -24,8 +24,7 @@ from src.evaluation.metrics import (
     f_score_at_k,
     ndcg_at_k,
     mean_average_precision,
-    area_under_roc_curve,
-    coverage_at_k
+    area_under_roc_curve
 )
 from app.utils import save_model
 
@@ -105,6 +104,7 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
 
     Returns:
     - recommenders: Dictionary containing all trained recommender instances.
+    - sampled_users: List of user IDs selected for evaluation.
     """
     # Map TITLE_ID to ORIGINAL_TITLE
     title_id_to_title = dict(zip(titles_df['TITLE_ID'], titles_df['ORIGINAL_TITLE']))
@@ -155,9 +155,9 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
     if not common_users:
         logging.error(
             "No common users found between training and test sets. Adjust the sample percentage or check your data.")
-        return {}
+        return {}, []
 
-    # Perform stratified sampling among common users
+    # Perform stratified sampling among common users to select 1000 users
     logging.info('Applying stratified sampling to select 1000 users for evaluation...')
     # Filter training data to include only common users
     train_common = train_df_sampled[train_df_sampled['BE_ID'].isin(common_users)].reset_index(drop=True)
@@ -175,7 +175,7 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
         sampled_users = random.sample(list(common_users), min(1000, len(common_users)))
     else:
         # Initialize StratifiedShuffleSplit
-        splitter = StratifiedShuffleSplit(n_splits=1, test_size=1000, random_state=config.RANDOM_STATE)
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=min(1000, len(common_users)), random_state=config.RANDOM_STATE)
         for train_idx, test_idx in splitter.split(user_interaction_counts, user_interaction_counts['interaction_bin']):
             sampled_users = user_interaction_counts.iloc[test_idx]['BE_ID'].tolist()
 
@@ -188,7 +188,7 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
     # Use the Reader class to parse the DataFrame
     reader = Reader(rating_scale=(interactions_df['rating'].min(), interactions_df['rating'].max()))
 
-    # Build trainset for collaborative filtering
+    # Build dataset for collaborative filtering
     train_data = Dataset.load_from_df(
         train_df_sampled[['BE_ID', 'TITLE_ID', 'rating']],
         reader
@@ -233,7 +233,7 @@ def initialize_and_train_recommenders(titles_df, interactions_df, tfidf_matrix_s
         logging.info(
             f'Initializing {"user-based" if user_based else "item-based"} collaborative filtering recommender with algorithm: {algo}')
         collaborative_recommender = CollaborativeFilteringRecommender(
-            data=train_data,
+            data=train_data,  # Pass the Dataset object instead of trainset
             algorithm=algo,
             algo_params={'random_state': config.RANDOM_STATE},
             user_based=user_based
@@ -279,13 +279,16 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     test_df_filtered = interactions_df[
         (interactions_df['BE_ID'].isin(sampled_users)) &
         (interactions_df['COLLECTOR_TSTAMP'] >= cutoff_date)
-        ].reset_index(drop=True)
+    ].reset_index(drop=True)
 
     # Prepare item popularity for coverage calculation
-    all_items = titles_df['TITLE_ID'].unique()
+    all_items = set(titles_df['TITLE_ID'].unique())
 
     # Prepare evaluation results list
     results = []
+
+    # To collect all recommended items for catalogue coverage
+    all_recommended_items = set()
 
     for model_key, recommender in recommenders.items():
         logging.info(f"Evaluating {model_key}...")
@@ -300,17 +303,16 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
             train_user_items = interactions_df[
                 (interactions_df['BE_ID'] == user_id) &
                 (interactions_df['COLLECTOR_TSTAMP'] < cutoff_date)
-                ]['TITLE_ID'].tolist()
+            ]['TITLE_ID'].tolist()
 
             # Get recommendations
-            if isinstance(recommender, ContentBasedRecommender) or isinstance(recommender,
-                                                                              WeightedContentBasedRecommender):
+            if isinstance(recommender, ContentBasedRecommender) or isinstance(recommender, WeightedContentBasedRecommender):
                 identifier_type = 'title'
                 if train_user_items:
                     representative_item = train_user_items[-1]
                     recommendations = recommender.get_recommendations(
                         title_id=representative_item,
-                        top_k=config.TOP_K,
+                        top_k=args.top_k,
                         exclude_items=train_user_items,
                         identifier_type=identifier_type
                     )
@@ -320,7 +322,7 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 identifier_type = 'user'
                 recommendations = recommender.get_recommendations(
                     identifier=user_id,
-                    top_k=config.TOP_K,
+                    top_k=args.top_k,
                     exclude_items=train_user_items,
                     identifier_type=identifier_type
                 )
@@ -328,21 +330,23 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 identifier_type = 'user'
                 recommendations = recommender.get_recommendations(
                     identifier=user_id,
-                    top_k=config.TOP_K,
+                    top_k=args.top_k,
                     exclude_items=train_user_items,
                     identifier_type=identifier_type
                 )
             else:
                 recommendations = []
 
+            # Add to the global set for catalogue coverage
+            all_recommended_items.update(recommendations)
+
             # Calculate metrics
-            precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
-            recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
+            precision = precision_at_k(recommendations, user_test_items, k=args.top_k)
+            recall = recall_at_k(recommendations, user_test_items, k=args.top_k)
             f_score = f_score_at_k(precision, recall)
-            ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
-            map_score = mean_average_precision(recommendations, user_test_items)
+            ndcg = ndcg_at_k(recommendations, user_test_items, k=args.top_k)
+            map_score = mean_average_precision(recommendations, user_test_items, k=args.top_k)
             auc_score = area_under_roc_curve(recommendations, user_test_items, all_items)
-            coverage = coverage_at_k(recommendations, all_items)
 
             # Determine Model Type and Algorithm for reporting
             if 'content_based_weighted' in model_key:
@@ -361,7 +365,7 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 model_type = 'Unknown'
                 algorithm = 'Unknown'
 
-            # Store results
+            # Store results without 'Coverage@K'
             results.append({
                 'Model Type': model_type,
                 'Algorithm': algorithm,
@@ -371,15 +375,15 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 'F1-Score@K': f_score,
                 'nDCG@K': ndcg,
                 'MAP@K': map_score,
-                'AUC': auc_score,
-                'Coverage@K': coverage
+                'AUC': auc_score
+                # 'Coverage@K': coverage  # Removed per-user coverage
             })
 
     # Create DataFrame from results
     results_df = pd.DataFrame(results)
 
     # Define numeric columns for averaging
-    numeric_cols = ['Precision@K', 'Recall@K', 'F1-Score@K', 'nDCG@K', 'MAP@K', 'AUC', 'Coverage@K']
+    numeric_cols = ['Precision@K', 'Recall@K', 'F1-Score@K', 'nDCG@K', 'MAP@K', 'AUC']
 
     # Ensure that the metric columns are numeric
     for col in numeric_cols:
@@ -390,7 +394,52 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     logging.info('\nAverage Recommendations Evaluation Results:')
     logging.info('\n' + average_metrics.to_string(index=False))
 
+    # Calculate Prediction Coverage
+    prediction_coverage = calculate_prediction_coverage(interactions_df, all_items, min_interactions=1)
+    logging.info(f'Prediction Coverage: {prediction_coverage:.4f}')
+
+    # Calculate Catalogue Coverage
+    catalogue_coverage = calculate_catalogue_coverage(all_recommended_items, all_items)
+    logging.info(f'Catalogue Coverage: {catalogue_coverage:.4f}')
+
+    # Optionally, calculate Weighted Catalogue Coverage if usefulness scores are defined
+    # weighted_catalogue_coverage = calculate_weighted_catalogue_coverage(all_recommended_items, useful_items)
+    # logging.info(f'Weighted Catalogue Coverage: {weighted_catalogue_coverage:.4f}')
+
     return results_df
+
+
+def calculate_prediction_coverage(interactions_df, all_items, min_interactions=1):
+    """
+    Calculates the Prediction Coverage.
+
+    Parameters:
+    - interactions_df: DataFrame containing user-item interactions.
+    - all_items: Set or list of all available item IDs.
+    - min_interactions: Minimum number of interactions required for an item to be eligible.
+
+    Returns:
+    - prediction_coverage: Float representing the prediction coverage percentage.
+    """
+    item_interaction_counts = interactions_df['TITLE_ID'].value_counts()
+    eligible_items = set(item_interaction_counts[item_interaction_counts >= min_interactions].index)
+    prediction_coverage = len(eligible_items) / len(all_items)
+    return prediction_coverage
+
+
+def calculate_catalogue_coverage(all_recommended_items, all_items):
+    """
+    Calculates the Catalogue Coverage.
+
+    Parameters:
+    - all_recommended_items: Set of all unique recommended item IDs across users.
+    - all_items: Set or list of all available item IDs.
+
+    Returns:
+    - catalogue_coverage: Float representing the catalogue coverage percentage.
+    """
+    catalogue_coverage = len(all_recommended_items) / len(all_items)
+    return catalogue_coverage
 
 
 def save_trained_models(recommenders):

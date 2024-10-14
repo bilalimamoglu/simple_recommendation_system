@@ -26,7 +26,6 @@ def main():
     # Parse command-line arguments
     args = parse_arguments()
 
-    # Load and preprocess data
     titles_df, interactions_df = load_and_preprocess_data(args)
 
     # Perform feature engineering
@@ -36,6 +35,10 @@ def main():
     recommenders, sampled_users = initialize_and_train_recommenders(
         titles_df, interactions_df, tfidf_matrix_svd, weighted_tfidf_matrix_svd, args
     )
+
+    if not recommenders:
+        logging.error("No recommenders trained. Exiting workflow.")
+        return
 
     # Evaluate recommenders
     evaluation_results = evaluate_recommenders(
@@ -51,7 +54,7 @@ def main():
     # Save trained models
     save_trained_models(recommenders)
 
-    logging.info("All processes completed successfully.")
+    logging.info("Workflow completed successfully.")
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 # src/models/collaborative_filtering.py
 
 import logging
-from surprise import KNNBaseline, SVD, SVDpp, NMF, Dataset
+from surprise import KNNBaseline, SVD, SVDpp, NMF
 from surprise import accuracy
 from src.models.recommender import Recommender
 from src import config
@@ -105,6 +105,10 @@ class CollaborativeFilteringRecommender(Recommender):
 
             # Get the top K item IDs
             top_k_items = [pred.iid for pred in predictions[:top_k]]
+
+            # Exclude specified items
+            if exclude_items:
+                top_k_items = [item for item in top_k_items if item not in exclude_items]
 
             return top_k_items
 
