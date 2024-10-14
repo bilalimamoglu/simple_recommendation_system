@@ -5,6 +5,57 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from src import config
 
+# src/feature_engineering/feature_engineer.py
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import hstack
+
+
+def create_weighted_count_matrix(titles_df, weights, max_features=5000, n_components=100):
+    """
+    Creates a weighted TF-IDF matrix from specified features and applies Truncated SVD.
+
+    Parameters:
+    - titles_df: DataFrame containing titles data.
+    - weights: Dictionary defining weights for each feature.
+    - max_features: Maximum number of features for each TF-IDF vectorizer.
+    - n_components: Number of components for Truncated SVD.
+
+    Returns:
+    - tfidf_matrix_svd: Reduced TF-IDF matrix after applying SVD.
+    - vectorizers: Dictionary of fitted TfidfVectorizer objects for each feature.
+    - svd: Fitted TruncatedSVD object.
+    """
+    tfidf_matrices = []
+    feature_weights = []
+    vectorizers = {}
+
+    # Generate TF-IDF matrices for each feature and apply the weights
+    for feature, weight in weights.items():
+        tfidf = TfidfVectorizer(stop_words='english', max_features=max_features)
+        # Ensure the feature data is a string
+        feature_data = titles_df[feature].apply(lambda x: ' '.join(x) if isinstance(x, list) else x)
+        tfidf_matrix = tfidf.fit_transform(feature_data)
+        tfidf_matrices.append(tfidf_matrix * weight)
+        feature_weights.append(weight)
+        vectorizers[feature] = tfidf
+
+    # Combine the TF-IDF matrices into a single weighted matrix
+    weighted_tfidf_matrix = hstack(tfidf_matrices)
+
+    print(f"Weighted TF-IDF Matrix Shape: {weighted_tfidf_matrix.shape}")
+
+    # Apply TruncatedSVD to reduce dimensions
+    svd = TruncatedSVD(n_components=n_components, random_state=config.RANDOM_STATE)
+    tfidf_matrix_svd = svd.fit_transform(weighted_tfidf_matrix)
+
+    print(f"Reduced TF-IDF Matrix Shape: {tfidf_matrix_svd.shape}")
+
+    return tfidf_matrix_svd, vectorizers, svd
+
+
 
 def process_text_features(titles_df):
     """

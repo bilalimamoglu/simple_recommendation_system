@@ -18,14 +18,17 @@ from app.utils import set_seed, save_model, load_model
 from src import config
 from src.data_processing.load_data import load_data
 from src.data_processing.preprocess import clean_titles_data, clean_interactions_data
-from src.feature_engineering.feature_engineer import process_text_features, create_count_matrix
-from src.models.content_based import ContentBasedRecommender
+from src.feature_engineering.feature_engineer import process_text_features, create_count_matrix, \
+    create_weighted_count_matrix
+from src.models.content_based import ContentBasedRecommender, WeightedContentBasedRecommender
 from src.models.collaborative_filtering import CollaborativeFilteringRecommender
 from src.models.hybrid_model import HybridRecommender
 from src.evaluation.metrics import (
     precision_at_k, recall_at_k, f_score_at_k, ndcg_at_k, mean_average_precision,
     area_under_roc_curve, coverage_at_k
 )
+
+from surprise import Reader
 
 
 def main():
@@ -60,6 +63,18 @@ def main():
     logging.info('Performing feature engineering...')
     titles_df = process_text_features(titles_df)
     tfidf_matrix_svd, vectorizer, svd = create_count_matrix(titles_df, max_features=args.max_features)
+
+    # Create weighted TF-IDF matrix
+    weights = {
+        'ORIGINAL_TITLE': args.title_weight,
+        'GENRE_TMDB': args.genre_weight,
+        'DIRECTOR': args.director_weight,
+        'ACTOR': args.actor_weight,
+        'PRODUCER': args.producer_weight
+    }
+    weighted_tfidf_matrix_svd, weighted_vectorizers, weighted_svd = create_weighted_count_matrix(
+        titles_df, weights, max_features=args.max_features, n_components=100
+    )
 
     # Map TITLE_ID to ORIGINAL_TITLE
     title_id_to_title = dict(zip(titles_df['TITLE_ID'], titles_df['ORIGINAL_TITLE']))
@@ -154,10 +169,16 @@ def main():
     title_id_to_idx = pd.Series(titles_df.index, index=titles_df['TITLE_ID']).drop_duplicates()
     idx_to_title_id = pd.Series(titles_df['TITLE_ID'].values, index=titles_df.index)
 
-    # Initialize and train content-based recommender
-    logging.info('Initializing content-based recommender...')
+    # Initialize and train standard content-based recommender
+    logging.info('Initializing standard content-based recommender...')
     content_recommender = ContentBasedRecommender(titles_df, tfidf_matrix_svd, idx_to_title_id)
     content_recommender.train()
+
+    # Initialize and train weighted content-based recommender
+    logging.info('Initializing weighted content-based recommender...')
+    weighted_content_recommender = WeightedContentBasedRecommender(titles_df, weighted_tfidf_matrix_svd,
+                                                                   idx_to_title_id)
+    weighted_content_recommender.train()
 
     # Define Algorithm Type Mappings
     user_based_algorithms = ['SVD', 'SVDpp', 'NMF']
@@ -203,10 +224,10 @@ def main():
     # Prepare evaluation results list
     results = []
 
-    # Evaluate Content-Based Recommender
-    logging.info("Evaluating Content-Based Model on the test set...")
+    # Evaluate Standard Content-Based Recommender
+    logging.info("Evaluating Standard Content-Based Model on the test set...")
 
-    for user_id in tqdm(sampled_users, desc="Evaluating Content-Based Model"):
+    for user_id in tqdm(sampled_users, desc="Evaluating Standard Content-Based Model"):
         # Get the items the user interacted with in the test set
         user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
 
@@ -242,6 +263,55 @@ def main():
         results.append({
             'Model Type': 'Content-Based',
             'Algorithm': 'Cosine Similarity',
+            'User ID': user_id,
+            'Precision@K': precision,
+            'Recall@K': recall,
+            'F1-Score@K': f_score,
+            'nDCG@K': ndcg,
+            'MAP@K': map_score,
+            'AUC': auc_score,
+            'Coverage@K': coverage
+        })
+
+    # Evaluate Weighted Content-Based Recommender
+    logging.info("Evaluating Weighted Content-Based Model on the test set...")
+
+    for user_id in tqdm(sampled_users, desc="Evaluating Weighted Content-Based Model"):
+        # Get the items the user interacted with in the test set
+        user_test_items = test_df_filtered[test_df_filtered['BE_ID'] == user_id]['TITLE_ID'].tolist()
+
+        if not user_test_items:
+            continue  # Skip users with no test interactions
+
+        # Get the user's training items
+        user_train_items = train_df_sampled[train_df_sampled['BE_ID'] == user_id]['TITLE_ID'].tolist()
+        if not user_train_items:
+            continue  # Skip users with no training interactions
+
+        # Assume the last item in training is the representative
+        representative_item = user_train_items[-1]
+
+        # Get recommendations
+        recommendations = weighted_content_recommender.get_recommendations(
+            title_id=representative_item,
+            top_k=config.TOP_K,
+            exclude_items=user_train_items,
+            identifier_type='title'
+        )
+
+        # Calculate metrics
+        precision = precision_at_k(recommendations, user_test_items, k=config.TOP_K)
+        recall = recall_at_k(recommendations, user_test_items, k=config.TOP_K)
+        f_score = f_score_at_k(precision, recall)
+        ndcg = ndcg_at_k(recommendations, user_test_items, k=config.TOP_K)
+        map_score = mean_average_precision(recommendations, user_test_items)
+        auc_score = area_under_roc_curve(recommendations, user_test_items, all_items)
+        coverage = coverage_at_k(recommendations, all_items)
+
+        # Store results
+        results.append({
+            'Model Type': 'Content-Based Weighted',
+            'Algorithm': 'Weighted Cosine Similarity',
             'User ID': user_id,
             'Precision@K': precision,
             'Recall@K': recall,
@@ -358,16 +428,10 @@ def main():
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
         results_df.to_csv(results_output_path, index=False)
         logging.info(f"Detailed evaluation results saved to {results_output_path}")
-
     else:
         logging.info("No evaluation results to display.")
 
-    # Optionally, save trained models
-    # Example: save_model(content_recommender, 'content_based')
-    #          save_model(collaborative_recommender, 'SVD')
-    #          save_model(hybrid_recommender, 'hybrid_svd')
-    # Uncomment and modify as needed
-
+    # Save trained models
     if collaborative_recommenders:
         for cf_recommender in collaborative_recommenders:
             save_model(cf_recommender.algo, cf_recommender.algorithm_name)
@@ -377,8 +441,9 @@ def main():
             hybrid_model_name = f"hybrid_{hybrid_recommender.collaborative_recommender.algorithm_name}"
             save_model(hybrid_recommender, hybrid_model_name)
 
-    # Save content-based model
+    # Save content-based models
     save_model(content_recommender, 'content_based')
+    save_model(weighted_content_recommender, 'content_based_weighted')
 
 
 if __name__ == '__main__':

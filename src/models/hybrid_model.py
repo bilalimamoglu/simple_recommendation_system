@@ -47,22 +47,21 @@ class HybridRecommender(Recommender):
         # Get collaborative filtering recommendations
         cf_recs = self.collaborative_recommender.get_recommendations(
             identifier=identifier,
-            top_k=top_k * 2,  # Get more items to allow overlap
+            top_k=int(top_k * self.alpha),  # Allocate alpha proportion to CF
             exclude_items=exclude_items,
             identifier_type=identifier_type
         )
 
-        # Get the user's training items
+        # Get content-based recommendations
+        # Assuming we use the last interacted item as a representative
         user_train_items = exclude_items if exclude_items else []
-
-        # Assume the last item in training is the representative
         if user_train_items:
             representative_item = user_train_items[-1]
-            # Get content-based recommendations
             cb_recs = self.content_recommender.get_recommendations(
                 title_id=representative_item,
-                top_k=top_k * 2,
-                exclude_items=user_train_items
+                top_k=int(top_k * (1 - self.alpha)),
+                exclude_items=user_train_items,
+                identifier_type='title'
             )
         else:
             cb_recs = []
@@ -74,5 +73,5 @@ class HybridRecommender(Recommender):
         if exclude_items:
             combined_recs = [item for item in combined_recs if item not in exclude_items]
 
-        # Return top K items
+        # Return top_k items
         return combined_recs[:top_k]
