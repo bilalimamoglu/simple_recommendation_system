@@ -7,6 +7,7 @@ from surprise import Dataset, Reader
 from sklearn.model_selection import StratifiedShuffleSplit
 import random
 from tqdm import tqdm
+import numpy as np
 
 from src.data_processing.load_data import load_data
 from src.data_processing.preprocess import clean_titles_data, clean_interactions_data
@@ -270,7 +271,9 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     - args: Parsed command-line arguments.
 
     Returns:
-    - results_df: DataFrame containing evaluation metrics for all recommenders.
+    - results_df: DataFrame containing user-based evaluation metrics for all recommenders.
+    - algorithm_metrics_df: DataFrame containing Prediction and Catalogue Coverage per algorithm.
+    - title_metrics_dfs: Dictionary containing DataFrames for each specified title.
     """
     logging.info("Starting evaluation of recommenders...")
 
@@ -287,8 +290,15 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     # Prepare evaluation results list
     results = []
 
-    # To collect all recommended items for catalogue coverage
-    all_recommended_items = set()
+    # Prepare a dictionary to hold coverage metrics per algorithm
+    algorithm_coverage = {model_key: {'Prediction Coverage': 0.0, 'Catalogue Coverage': 0.0} for model_key in recommenders.keys()}
+
+    # To collect all recommended items per algorithm for catalogue coverage
+    recommended_items_per_algorithm = {model_key: set() for model_key in recommenders.keys()}
+
+    # To hold metrics per title
+    title_ids = ['tm107473', 'tm50355', 'ts89259']
+    title_metrics = {title_id: [] for title_id in title_ids}
 
     for model_key, recommender in recommenders.items():
         logging.info(f"Evaluating {model_key}...")
@@ -337,10 +347,10 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
             else:
                 recommendations = []
 
-            # Add to the global set for catalogue coverage
-            all_recommended_items.update(recommendations)
+            # Add to the global set for catalogue coverage per algorithm
+            recommended_items_per_algorithm[model_key].update(recommendations)
 
-            # Calculate metrics
+            # Calculate user-based metrics
             precision = precision_at_k(recommendations, user_test_items, k=args.top_k)
             recall = recall_at_k(recommendations, user_test_items, k=args.top_k)
             f_score = f_score_at_k(precision, recall)
@@ -365,7 +375,7 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 model_type = 'Unknown'
                 algorithm = 'Unknown'
 
-            # Store results without 'Coverage@K'
+            # Store results
             results.append({
                 'Model Type': model_type,
                 'Algorithm': algorithm,
@@ -376,10 +386,57 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
                 'nDCG@K': ndcg,
                 'MAP@K': map_score,
                 'AUC': auc_score
-                # 'Coverage@K': coverage  # Removed per-user coverage
             })
 
-    # Create DataFrame from results
+            # Per-Title Metrics
+            for title_id in title_ids:
+                # Check if the user interacted with this title in training
+                if title_id in train_user_items:
+                    # Get all interactions after the interaction with the title
+                    user_interactions_sorted = interactions_df[
+                        (interactions_df['BE_ID'] == user_id) &
+                        (interactions_df['COLLECTOR_TSTAMP'] >= cutoff_date)
+                    ].sort_values('COLLECTOR_TSTAMP')
+
+                    # Find the interaction timestamp with the title
+                    title_interactions = interactions_df[
+                        (interactions_df['BE_ID'] == user_id) &
+                        (interactions_df['TITLE_ID'] == title_id)
+                    ]
+
+                    if not title_interactions.empty:
+                        # Assuming the latest interaction with the title
+                        title_last_interaction = title_interactions['COLLECTOR_TSTAMP'].max()
+
+                        # Count interactions after the title interaction
+                        post_title_interactions = interactions_df[
+                            (interactions_df['BE_ID'] == user_id) &
+                            (interactions_df['COLLECTOR_TSTAMP'] > title_last_interaction)
+                        ]
+
+                        if len(post_title_interactions) >= 1:
+                            # Only consider users with at least 1 interaction after the title interaction
+                            precision_title = precision_at_k(recommendations, user_test_items, k=args.top_k)
+                            recall_title = recall_at_k(recommendations, user_test_items, k=args.top_k)
+                            f_score_title = f_score_at_k(precision_title, recall_title)
+                            ndcg_title = ndcg_at_k(recommendations, user_test_items, k=args.top_k)
+                            map_score_title = mean_average_precision(recommendations, user_test_items, k=args.top_k)
+                            auc_score_title = area_under_roc_curve(recommendations, user_test_items, all_items)
+
+                            # Append to title metrics
+                            title_metrics[title_id].append({
+                                'Model Type': model_type,
+                                'Algorithm': algorithm,
+                                'User ID': user_id,
+                                'Precision@K': precision_title,
+                                'Recall@K': recall_title,
+                                'F1-Score@K': f_score_title,
+                                'nDCG@K': ndcg_title,
+                                'MAP@K': map_score_title,
+                                'AUC': auc_score_title
+                            })
+
+    # Create DataFrame from user-based results
     results_df = pd.DataFrame(results)
 
     # Define numeric columns for averaging
@@ -389,24 +446,59 @@ def evaluate_recommenders(recommenders, interactions_df, titles_df, sampled_user
     for col in numeric_cols:
         results_df[col] = pd.to_numeric(results_df[col], errors='coerce')
 
-    # Compute average metrics across all users
+    # Compute average metrics across all users per algorithm
     average_metrics = results_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
     logging.info('\nAverage Recommendations Evaluation Results:')
     logging.info('\n' + average_metrics.to_string(index=False))
 
-    # Calculate Prediction Coverage
-    prediction_coverage = calculate_prediction_coverage(interactions_df, all_items, min_interactions=1)
-    logging.info(f'Prediction Coverage: {prediction_coverage:.4f}')
+    # Calculate Prediction Coverage and Catalogue Coverage per algorithm
+    for model_key, recommended_items in recommended_items_per_algorithm.items():
+        # Filter interactions for items with at least min_interactions (assuming min_interactions=1)
+        prediction_coverage = calculate_prediction_coverage(interactions_df, all_items, min_interactions=1)
+        # Update Prediction Coverage per algorithm
+        algorithm_coverage[model_key]['Prediction Coverage'] = prediction_coverage
 
-    # Calculate Catalogue Coverage
-    catalogue_coverage = calculate_catalogue_coverage(all_recommended_items, all_items)
-    logging.info(f'Catalogue Coverage: {catalogue_coverage:.4f}')
+        # Catalogue Coverage
+        catalogue_coverage = calculate_catalogue_coverage(recommended_items, all_items)
+        algorithm_coverage[model_key]['Catalogue Coverage'] = catalogue_coverage
 
-    # Optionally, calculate Weighted Catalogue Coverage if usefulness scores are defined
-    # weighted_catalogue_coverage = calculate_weighted_catalogue_coverage(all_recommended_items, useful_items)
-    # logging.info(f'Weighted Catalogue Coverage: {weighted_catalogue_coverage:.4f}')
+    # Create DataFrame for algorithm coverage metrics
+    algorithm_metrics = []
+    for model_key, coverage in algorithm_coverage.items():
+        # Retrieve Model Type for the algorithm
+        matching_row = average_metrics[average_metrics['Algorithm'] == model_key.split('_')[-1]]
+        if not matching_row.empty:
+            model_type = matching_row['Model Type'].values[0]
+        else:
+            model_type = 'Unknown'
 
-    return results_df
+        algorithm_metrics.append({
+            'Model Type': model_type,
+            'Algorithm': model_key,
+            'Prediction Coverage': coverage['Prediction Coverage'],
+            'Catalogue Coverage': coverage['Catalogue Coverage']
+        })
+    algorithm_metrics_df = pd.DataFrame(algorithm_metrics)
+
+    logging.info('\nAlgorithm Coverage Evaluation Results:')
+    logging.info('\n' + algorithm_metrics_df.to_string(index=False))
+
+    # Calculate metrics per title
+    title_metrics_dfs = {}
+    for title_id, metrics_list in title_metrics.items():
+        if metrics_list:
+            title_df = pd.DataFrame(metrics_list)
+            # Compute average metrics for the title
+            average_title_metrics = title_df.groupby(['Model Type', 'Algorithm'])[numeric_cols].mean().reset_index()
+            title_metrics_dfs[title_id] = average_title_metrics
+            logging.info(f'\nAverage Metrics for Title ID {title_id}:')
+            logging.info('\n' + average_title_metrics.to_string(index=False))
+        else:
+            logging.info(f'\nNo eligible users found for Title ID {title_id}.')
+            title_metrics_dfs[title_id] = pd.DataFrame(columns=['Model Type', 'Algorithm'] + numeric_cols)
+
+    # Return all relevant DataFrames
+    return results_df, algorithm_metrics_df, title_metrics_dfs
 
 
 def calculate_prediction_coverage(interactions_df, all_items, min_interactions=1):
