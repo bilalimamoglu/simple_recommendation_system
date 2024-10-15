@@ -14,12 +14,8 @@ Welcome to the **Simple Recommendation System**! This project is designed to bui
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
 - [Usage](#usage)
-  - [Simple Approach](#simple-approach-1)
   - [Advanced Approach](#advanced-approach-1)
-- [Evaluation Metrics](#evaluation-metrics)
 - [Unit Tests](#unit-tests)
-- [Contributing](#contributing)
-- [License](#license)
 - [Contact](#contact)
 
 ## Introduction
