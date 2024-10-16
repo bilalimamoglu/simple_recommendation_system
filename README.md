@@ -114,6 +114,12 @@ Ensure you have the following installed on your system:
     ```bash
     pip install -r requirements.txt
     ```
+   
+4. **Make sure you download the titles and title_interactions to /notebooks folder for Simple Approach, /data/raw folder for Advanced Approach **
+
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 ## Advanced Approach
 
